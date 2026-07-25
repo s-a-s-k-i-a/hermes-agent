@@ -6787,13 +6787,25 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
 
     profile = get_provider_profile(provider_id)
     marker_paths: list[str] = []
+    data_root: Optional[Path] = None
+    if profile and profile.external_data_root_env_var:
+        raw_root = os.getenv(profile.external_data_root_env_var, "").strip()
+        if not raw_root:
+            raw_root = str(profile.external_default_data_root or "").strip()
+        if raw_root:
+            if raw_root.startswith("~/"):
+                data_root = Path.home() / raw_root[2:]
+            else:
+                data_root = Path(raw_root).expanduser()
     for raw_marker in tuple(
         getattr(profile, "external_login_markers", ()) if profile else ()
     ):
         marker = str(raw_marker or "").strip()
         if not marker:
             continue
-        if marker.startswith("~/"):
+        if data_root is not None and not Path(marker).is_absolute():
+            marker_path = data_root / marker
+        elif marker.startswith("~/"):
             marker_path = Path.home() / marker[2:]
         else:
             marker_path = Path(marker).expanduser()
@@ -6816,6 +6828,57 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
         "login_markers": marker_paths,
         "credential_owner": f"{provider_id.removesuffix('-acp')}-cli",
     }
+
+
+_EXTERNAL_PROCESS_ESSENTIAL_ENV_VARS = frozenset(
+    {
+        "PATH",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+    }
+)
+
+
+def build_external_process_subprocess_env(provider_id: str) -> Dict[str, str]:
+    """Build the child environment for a model-driving external CLI.
+
+    Copilot keeps its established credential-inheritance behavior. Other
+    external-process providers receive a minimal process environment plus only
+    provider-declared, non-secret variables.
+    """
+    from tools.environments.local import hermes_subprocess_env
+
+    if provider_id == "copilot-acp":
+        return hermes_subprocess_env(inherit_credentials=True)
+
+    from hermes_constants import get_real_home
+    from providers import get_provider_profile
+
+    profile = get_provider_profile(provider_id)
+    declared = set(getattr(profile, "external_process_env_vars", ()) or ())
+    allowed = _EXTERNAL_PROCESS_ESSENTIAL_ENV_VARS | declared
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name in allowed and value
+    }
+    home = get_real_home(os.environ)
+    env["HOME"] = home
+    env["HERMES_REAL_HOME"] = home
+    return env
 
 
 def run_external_process_provider_login(provider_id: str) -> subprocess.CompletedProcess:
@@ -6846,19 +6909,7 @@ def run_external_process_provider_login(provider_id: str) -> subprocess.Complete
             code="missing_external_process_login",
         )
 
-    from tools.environments.local import hermes_subprocess_env
-
-    login_excluded = frozenset(
-        key
-        for key in os.environ
-        if provider_id == "kimi-code"
-        and key.upper().startswith("KIMI")
-        and ("TOKEN" in key.upper() or "API_KEY" in key.upper())
-    )
-    login_env = hermes_subprocess_env(
-        inherit_credentials=False,
-        excluded_keys=login_excluded,
-    )
+    login_env = build_external_process_subprocess_env(provider_id)
     result = subprocess.run(
         [resolved_command, *login_args],
         check=False,
@@ -6871,6 +6922,60 @@ def run_external_process_provider_login(provider_id: str) -> subprocess.Complete
             code="external_process_login_failed",
         )
     return result
+
+
+def run_external_process_provider_logout(provider_id: str) -> bool:
+    """Run a declared external logout operation and verify marker removal."""
+    from providers import get_provider_profile
+
+    profile = get_provider_profile(provider_id)
+    if profile is None or profile.auth_type != "external_process":
+        return False
+
+    status = get_external_process_provider_status(provider_id)
+    logout_args = [str(arg) for arg in profile.external_logout_args]
+    if logout_args:
+        if not status.get("logged_in"):
+            return False
+        command = str(status.get("resolved_command") or "").strip()
+        if not command:
+            return False
+        result = subprocess.run(
+            [command, *logout_args],
+            check=False,
+            env=build_external_process_subprocess_env(provider_id),
+        )
+        if result.returncode != 0:
+            raise AuthError(
+                f"{provider_id} CLI logout exited with status {result.returncode}.",
+                provider=provider_id,
+                code="external_process_logout_failed",
+            )
+    elif profile.external_logout_removes_login_markers:
+        removed = False
+        for marker_text in status.get("login_markers") or []:
+            marker = Path(str(marker_text))
+            try:
+                marker.unlink()
+                removed = True
+            except FileNotFoundError:
+                continue
+        if not removed:
+            return False
+    else:
+        raise AuthError(
+            f"Provider '{provider_id}' does not declare a safe logout operation.",
+            provider=provider_id,
+            code="missing_external_process_logout",
+        )
+
+    if get_external_process_provider_status(provider_id).get("logged_in"):
+        raise AuthError(
+            f"{provider_id} CLI still reports a login marker after logout.",
+            provider=provider_id,
+            code="external_process_logout_incomplete",
+        )
+    return True
 
 
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
@@ -9002,8 +9107,12 @@ def logout_command(args) -> None:
 
     should_reset_config = _should_reset_config_provider_on_logout(target)
     provider_name = get_auth_provider_display_name(target)
+    pconfig = PROVIDER_REGISTRY.get(target)
+    external_logged_out = False
+    if pconfig and pconfig.auth_type == "external_process":
+        external_logged_out = run_external_process_provider_logout(target)
 
-    if clear_provider_auth(target) or should_reset_config:
+    if clear_provider_auth(target) or should_reset_config or external_logged_out:
         if should_reset_config:
             _reset_config_provider()
         print(f"Logged out of {provider_name}.")

@@ -45,10 +45,12 @@ def test_kimi_code_profile_and_provider_catalog_metadata():
     assert profile.external_preferred_commands == ("~/.kimi-code/bin/kimi",)
     assert profile.external_default_command == "kimi"
     assert profile.external_default_args == ("acp",)
+    assert profile.external_process_env_vars == ("KIMI_CODE_HOME",)
+    assert profile.external_data_root_env_var == "KIMI_CODE_HOME"
+    assert profile.external_default_data_root == "~/.kimi-code"
     assert profile.external_login_args == ("login",)
-    assert profile.external_login_markers == (
-        "~/.kimi-code/credentials/kimi-code.json",
-    )
+    assert profile.external_login_markers == ("credentials/kimi-code.json",)
+    assert profile.external_logout_removes_login_markers is True
 
     registry = PROVIDER_REGISTRY["kimi-code"]
     assert registry.auth_type == "external_process"
@@ -109,6 +111,85 @@ def test_kimi_code_status_distinguishes_installed_cli_from_logged_in_marker(
     )
 
 
+def test_kimi_code_status_resolves_marker_from_relocated_data_root(
+    tmp_path, monkeypatch
+):
+    from hermes_cli.auth import get_external_process_provider_status
+
+    home = tmp_path / "home"
+    home.mkdir()
+    binary = _install_fake_kimi(home)
+    provider_home = tmp_path / "relocated-kimi"
+    marker = provider_home / "credentials" / "kimi-code.json"
+    marker.parent.mkdir(parents=True)
+    marker.touch()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("KIMI_CODE_HOME", str(provider_home))
+    _clear_external_process_overrides(monkeypatch)
+    monkeypatch.setenv("KIMI_CODE_CLI_PATH", str(binary))
+
+    status = get_external_process_provider_status("kimi-code")
+
+    assert status["installed"] is True
+    assert status["logged_in"] is True
+    assert status["configured"] is True
+    assert status["login_markers"] == [str(marker)]
+
+
+def test_kimi_code_logout_removes_cli_owned_marker_from_relocated_root(
+    tmp_path, monkeypatch, capsys
+):
+    from hermes_cli.auth import get_external_process_provider_status, logout_command
+
+    home = tmp_path / "home"
+    home.mkdir()
+    binary = _install_fake_kimi(home)
+    provider_home = tmp_path / "relocated-kimi"
+    marker = provider_home / "credentials" / "kimi-code.json"
+    marker.parent.mkdir(parents=True)
+    marker.touch()
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    auth_path = hermes_home / "auth.json"
+    original_auth = '{"version": 1, "providers": {}, "credential_pool": {}}\n'
+    auth_path.write_text(original_auth, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("KIMI_CODE_HOME", str(provider_home))
+    _clear_external_process_overrides(monkeypatch)
+    monkeypatch.setenv("KIMI_CODE_CLI_PATH", str(binary))
+
+    assert get_external_process_provider_status("kimi-code")["logged_in"] is True
+    logout_command(SimpleNamespace(provider="kimi-code"))
+
+    assert marker.exists() is False
+    assert get_external_process_provider_status("kimi-code")["logged_in"] is False
+    assert auth_path.read_text(encoding="utf-8") == original_auth
+    assert "Logged out of Kimi Code" in capsys.readouterr().out
+
+
+def test_kimi_code_logout_removes_owned_marker_even_when_cli_is_missing(
+    tmp_path, monkeypatch, capsys
+):
+    from hermes_cli.auth import logout_command
+
+    home = tmp_path / "home"
+    marker = home / ".kimi-code" / "credentials" / "kimi-code.json"
+    marker.parent.mkdir(parents=True)
+    marker.touch()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("HOME", str(home))
+    _clear_external_process_overrides(monkeypatch)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+
+    logout_command(SimpleNamespace(provider="kimi-code"))
+
+    assert marker.exists() is False
+    assert "Logged out of Kimi Code" in capsys.readouterr().out
+
+
 def test_auth_add_kimi_code_runs_visible_cli_login_without_prompting_or_pool_store(
     tmp_path, monkeypatch
 ):
@@ -127,6 +208,12 @@ def test_auth_add_kimi_code_runs_visible_cli_login_without_prompting_or_pool_sto
     monkeypatch.setenv("GH_TOKEN", "must-not-leak")
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
     monkeypatch.setenv("KIMI_ACCESS_TOKEN", "must-not-leak")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-leak")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "must-not-leak")
+    monkeypatch.setenv("AWS_PROFILE", "must-not-leak")
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "agent.sock"))
+    provider_home = tmp_path / "relocated-kimi"
+    monkeypatch.setenv("KIMI_CODE_HOME", str(provider_home))
     _clear_external_process_overrides(monkeypatch)
     monkeypatch.setenv("KIMI_CODE_CLI_PATH", str(binary))
     monkeypatch.setattr(
@@ -167,9 +254,31 @@ def test_auth_add_kimi_code_runs_visible_cli_login_without_prompting_or_pool_sto
     argv, kwargs = calls[0]
     assert argv == [str(binary), "login"]
     assert kwargs["check"] is False
+    allowed_from_parent = {
+        "PATH",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "KIMI_CODE_HOME",
+    }
+    expected_keys = {name for name in allowed_from_parent if name in os.environ}
+    expected_keys.update({"HOME", "HERMES_REAL_HOME"})
+    assert set(kwargs["env"]) == expected_keys
     assert kwargs["env"]["HOME"] == str(home)
-    for secret_name in ("GH_TOKEN", "OPENAI_API_KEY", "KIMI_ACCESS_TOKEN"):
-        assert secret_name not in kwargs["env"]
+    assert kwargs["env"]["HERMES_REAL_HOME"] == str(home)
+    assert kwargs["env"]["KIMI_CODE_HOME"] == str(provider_home)
     assert auth_path.read_text(encoding="utf-8") == original_auth
 
 

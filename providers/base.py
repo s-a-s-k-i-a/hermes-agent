@@ -66,11 +66,19 @@ class ProviderProfile:
     external_default_command: str = ""
     external_args_env_var: str = ""
     external_default_args: tuple = ()
+    # Non-secret variables the child genuinely needs in addition to the
+    # minimal cross-platform process environment. External model drivers do
+    # not inherit the broad host environment by default.
+    external_process_env_vars: tuple = ()
+    external_data_root_env_var: str = ""
+    external_default_data_root: str = ""
     # Optional CLI-owned authentication metadata.  Hermes may invoke the
     # login command and inspect marker *existence*, but never reads or stores
     # the child process's credential contents.
     external_login_args: tuple = ()
     external_login_markers: tuple = ()
+    external_logout_args: tuple = ()
+    external_logout_removes_login_markers: bool = False
 
     # ── Vision support ────────────────────────────────────────
     # True when the provider's API accepts image content inside
