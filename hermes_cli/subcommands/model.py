@@ -25,6 +25,23 @@ def build_model_parser(subparsers, *, cmd_model: Callable) -> None:
         help="Wipe the model picker disk cache and re-fetch every provider's live /v1/models list.",
     )
     model_parser.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "Set the provider non-interactively (no picker, no TTY needed). "
+            "Combine with --model, or omit --model to use the provider's "
+            "default model."
+        ),
+    )
+    model_parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Set the default model non-interactively. Requires --provider "
+            "(or an already-configured provider)."
+        ),
+    )
+    model_parser.add_argument(
         "--portal-url",
         help="Portal base URL for Nous login (default: production portal)",
     )

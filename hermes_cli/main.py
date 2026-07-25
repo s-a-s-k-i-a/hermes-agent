@@ -2936,6 +2936,14 @@ def cmd_setup(args):
 
 def cmd_model(args):
     """Select default model — starts with provider selection, then model picker."""
+    provider_flag = getattr(args, "provider", None)
+    model_flag = getattr(args, "model", None)
+    # Flag PRESENCE selects the non-interactive path: an explicitly passed
+    # empty value (--provider '' / --model '') must be a validation error
+    # (exit 2), never a silent fall-through into the interactive TTY picker.
+    if provider_flag is not None or model_flag is not None:
+        _cmd_model_noninteractive(provider_flag, model_flag)
+        return
     _require_tty("model")
     if getattr(args, "refresh", False):
         try:
@@ -2945,6 +2953,63 @@ def cmd_model(args):
         except Exception:
             pass
     select_provider_and_model(args=args)
+
+
+def _cmd_model_noninteractive(provider_flag, model_flag) -> None:
+    """Promptless `hermes model --provider ... --model ...` path.
+
+    Never requires a TTY, never opens a picker, never prompts for
+    credentials. Exit codes: 0 success, 2 validation error, 3 missing
+    credential prerequisite.
+    """
+    from hermes_cli.model_noninteractive import (
+        NonInteractiveSelectionError,
+        apply_noninteractive_model_selection,
+        resolve_noninteractive_selection,
+    )
+
+    # Explicit empty flag values are usage errors (exit 2) — a passed-but-
+    # blank --provider must not fall back to the configured provider, and a
+    # passed-but-blank --model must not silently pick a default model.
+    if provider_flag is not None and not str(provider_flag).strip():
+        print(
+            "Error: --provider requires a non-empty provider id.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if model_flag is not None and not str(model_flag).strip():
+        print(
+            "Error: --model requires a non-empty model id.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if provider_flag is None:
+        # --model without --provider: reuse the configured provider.
+        from hermes_cli.config import load_config
+
+        model_cfg = load_config().get("model")
+        if isinstance(model_cfg, dict):
+            provider_flag = model_cfg.get("provider")
+        if not provider_flag:
+            print(
+                "Error: --model requires --provider (no provider configured "
+                "in config.yaml).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    try:
+        selection = resolve_noninteractive_selection(provider_flag, model_flag)
+        apply_noninteractive_model_selection(selection)
+    except NonInteractiveSelectionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(exc.exit_code)
+
+    print(
+        f"Default model set to: {selection['model']} "
+        f"(via {selection['provider']})"
+    )
 
 
 def _is_profile_api_key_provider(provider_id: str) -> bool:
