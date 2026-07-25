@@ -224,3 +224,106 @@ def test_runtime_provider_resolves_kimi_code_without_api_key(tmp_path, monkeypat
         "source": "process",
         "requested_provider": "kimi-code",
     }
+
+
+def test_interactive_kimi_model_flow_runs_cli_owned_login_before_persisting(
+    tmp_path, monkeypatch
+):
+    from hermes_cli.config import load_config
+    from hermes_cli.model_setup_flows import _model_flow_kimi_code
+
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    statuses = iter(
+        [
+            {
+                "installed": True,
+                "logged_in": False,
+                "command": "kimi",
+                "resolved_command": "/tmp/kimi",
+                "base_url": "acp://kimi",
+            },
+            {
+                "installed": True,
+                "logged_in": True,
+                "command": "kimi",
+                "resolved_command": "/tmp/kimi",
+                "base_url": "acp://kimi",
+            },
+        ]
+    )
+    login_calls = []
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_external_process_provider_status",
+        lambda _provider: next(statuses),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.run_external_process_provider_login",
+        lambda provider: login_calls.append(provider)
+        or subprocess.CompletedProcess(["kimi", "login"], 0),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_external_process_provider_credentials",
+        lambda _provider: {"base_url": "acp://kimi", "command": "/tmp/kimi"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth._prompt_model_selection", lambda *_args, **_kwargs: "k3"
+    )
+
+    _model_flow_kimi_code({}, current_model="")
+
+    assert login_calls == ["kimi-code"]
+    model = load_config()["model"]
+    assert model["provider"] == "kimi-code"
+    assert model["default"] == "k3"
+    assert model["base_url"] == "acp://kimi"
+
+
+def test_interactive_kimi_login_failure_leaves_config_byte_identical(
+    tmp_path, monkeypatch
+):
+    from hermes_cli.auth import AuthError
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.model_setup_flows import _model_flow_kimi_code
+
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    cfg = load_config()
+    cfg["model"] = {"provider": "anthropic", "default": "prior-model"}
+    save_config(cfg)
+    config_path = hermes_home / "config.yaml"
+    before = config_path.read_bytes()
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_external_process_provider_status",
+        lambda _provider: {
+            "installed": True,
+            "logged_in": False,
+            "command": "kimi",
+            "resolved_command": "/tmp/kimi",
+            "base_url": "acp://kimi",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.run_external_process_provider_login",
+        lambda _provider: (_ for _ in ()).throw(
+            AuthError(
+                "login failed sentinel",
+                provider="kimi-code",
+                code="external_process_login_failed",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth._prompt_model_selection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("model picker must not run after failed login")
+        ),
+    )
+
+    _model_flow_kimi_code({}, current_model="")
+
+    assert config_path.read_bytes() == before
+    assert load_config()["model"] == {
+        "provider": "anthropic",
+        "default": "prior-model",
+    }

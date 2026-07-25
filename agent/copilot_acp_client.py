@@ -33,6 +33,20 @@ from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
+_MAX_CHILD_DIAGNOSTIC_CHARS = 4096
+
+
+def _safe_child_diagnostic(text: Any) -> str:
+    """Bound and forcibly redact untrusted child-process diagnostics."""
+    cleaned = str(text or "").strip()
+    if len(cleaned) > _MAX_CHILD_DIAGNOSTIC_CHARS:
+        half = _MAX_CHILD_DIAGNOSTIC_CHARS // 2
+        cleaned = (
+            cleaned[:half]
+            + "\n...[child diagnostic truncated]...\n"
+            + cleaned[-half:]
+        )
+    return redact_sensitive_text(cleaned, force=True) or ""
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
@@ -483,7 +497,9 @@ class ExternalACPClient:
         self._allow_file_writes = allow_file_writes
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
+        self._request_lock = threading.Lock()
         self._active_process: subprocess.Popen[str] | None = None
+        self._active_cancel_event: threading.Event | None = None
         self._active_process_lock = threading.Lock()
 
     def close(self) -> None:
@@ -491,7 +507,12 @@ class ExternalACPClient:
         with self._active_process_lock:
             proc = self._active_process
             self._active_process = None
+            self._active_cancel_event = None
         self.is_closed = True
+        self._terminate_process(proc)
+
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen[str] | None) -> None:
         if proc is None:
             return
         try:
@@ -503,6 +524,17 @@ class ExternalACPClient:
             except Exception:
                 pass
 
+    def _cancel_request(self, cancel_event: threading.Event) -> None:
+        """Cancel only the subprocess owned by one async request."""
+        cancel_event.set()
+        proc: subprocess.Popen[str] | None = None
+        with self._active_process_lock:
+            if self._active_cancel_event is cancel_event:
+                proc = self._active_process
+                self._active_process = None
+                self._active_cancel_event = None
+        self._terminate_process(proc)
+
     def _create_chat_completion(
         self,
         *,
@@ -512,6 +544,34 @@ class ExternalACPClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
         stream: bool = False,
+        _cancel_event: threading.Event | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Serialize one full ACP subprocess lifecycle per client instance."""
+        with self._request_lock:
+            if _cancel_event is not None and _cancel_event.is_set():
+                raise RuntimeError(f"{self._acp_label} request was cancelled.")
+            return self._create_chat_completion_locked(
+                model=model,
+                messages=messages,
+                timeout=timeout,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+                _cancel_event=_cancel_event,
+                **kwargs,
+            )
+
+    def _create_chat_completion_locked(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        timeout: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        stream: bool = False,
+        _cancel_event: threading.Event | None = None,
         **_: Any,
     ) -> Any:
         prompt_text = _format_messages_as_prompt(
@@ -548,6 +608,8 @@ class ExternalACPClient:
         run_kwargs: dict[str, Any] = {"timeout_seconds": _effective_timeout}
         if self.provider == "kimi-code":
             run_kwargs["model"] = model
+        if _cancel_event is not None:
+            run_kwargs["cancel_event"] = _cancel_event
         response_text, reasoning_text = self._run_prompt(prompt_text, **run_kwargs)
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
@@ -582,6 +644,7 @@ class ExternalACPClient:
         *,
         timeout_seconds: float,
         model: str | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[str, str]:
         try:
             # Hide the console the CLI child would otherwise flash on Windows
@@ -604,15 +667,24 @@ class ExternalACPClient:
                 f"Could not start {self._acp_label} command '{self._acp_command}'."
             ) from exc
 
-        if proc.stdin is None or proc.stdout is None:
-            proc.kill()
+        if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+            self._terminate_process(proc)
             raise RuntimeError(
                 f"{self._acp_label} process did not expose stdin/stdout pipes."
             )
+        proc_stdin = proc.stdin
 
         self.is_closed = False
+        cancelled_before_start = False
         with self._active_process_lock:
-            self._active_process = proc
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled_before_start = True
+            else:
+                self._active_process = proc
+                self._active_cancel_event = cancel_event
+        if cancelled_before_start:
+            self._terminate_process(proc)
+            raise RuntimeError(f"{self._acp_label} request was cancelled.")
 
         inbox: queue.Queue[dict[str, Any]] = queue.Queue()
         stderr_tail: deque[str] = deque(maxlen=40)
@@ -649,11 +721,15 @@ class ExternalACPClient:
                 "method": method,
                 "params": params,
             }
-            proc.stdin.write(json.dumps(payload) + "\n")
-            proc.stdin.flush()
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError(f"{self._acp_label} request was cancelled.")
+            proc_stdin.write(json.dumps(payload) + "\n")
+            proc_stdin.flush()
 
             deadline = time.monotonic() + timeout_seconds
             while time.monotonic() < deadline:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError(f"{self._acp_label} request was cancelled.")
                 if proc.poll() is not None:
                     break
                 try:
@@ -674,12 +750,15 @@ class ExternalACPClient:
                     continue
                 if "error" in msg:
                     err = msg.get("error") or {}
+                    detail = _safe_child_diagnostic(
+                        err.get("message") if isinstance(err, dict) else err
+                    )
                     raise RuntimeError(
-                        f"{self._acp_label} {method} failed: {err.get('message') or err}"
+                        f"{self._acp_label} {method} failed: {detail}"
                     )
                 return msg.get("result")
 
-            stderr_text = "\n".join(stderr_tail).strip()
+            stderr_text = _safe_child_diagnostic("\n".join(stderr_tail))
             if proc.poll() is not None and stderr_text:
                 if (
                     self.provider == "copilot-acp"
@@ -740,7 +819,9 @@ class ExternalACPClient:
                 )
                 if not login_method:
                     raise RuntimeError(
-                        f"{self._acp_label} did not advertise its CLI-owned login method."
+                        "Kimi Code CLI 0.29.1 or newer is required; this ACP "
+                        "server did not advertise its CLI-owned login method. "
+                        "Upgrade with `kimi upgrade`, then retry."
                     )
                 _request("authenticate", {"methodId": login_method})
 
@@ -899,10 +980,16 @@ class _AsyncExternalACPCompletions:
         self._sync_client = sync_client
 
     async def create(self, **kwargs: Any):
-        return await asyncio.to_thread(
-            self._sync_client.chat.completions.create,
-            **kwargs,
-        )
+        cancel_event = threading.Event()
+        try:
+            return await asyncio.to_thread(
+                self._sync_client.chat.completions.create,
+                _cancel_event=cancel_event,
+                **kwargs,
+            )
+        except asyncio.CancelledError:
+            self._sync_client._cancel_request(cancel_event)
+            raise
 
 
 class AsyncExternalACPClient:
@@ -915,6 +1002,22 @@ class AsyncExternalACPClient:
         self.chat = SimpleNamespace(
             completions=_AsyncExternalACPCompletions(sync_client)
         )
+
+    @property
+    def is_closed(self) -> bool:
+        return self._sync_client.is_closed
+
+    def close(self) -> None:
+        self._sync_client.close()
+
+    async def aclose(self) -> None:
+        await asyncio.to_thread(self._sync_client.close)
+
+    async def __aenter__(self) -> "AsyncExternalACPClient":
+        return self
+
+    async def __aexit__(self, *_exc_info: Any) -> None:
+        await self.aclose()
 
 
 class CopilotACPClient(ExternalACPClient):

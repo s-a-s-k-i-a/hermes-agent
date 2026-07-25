@@ -1955,6 +1955,7 @@ def _model_flow_kimi_code(config, current_model=""):
         deactivate_provider,
         get_external_process_provider_status,
         resolve_external_process_provider_credentials,
+        run_external_process_provider_login,
     )
     from hermes_cli.config import load_config, save_config
     from providers import get_provider_profile
@@ -1985,6 +1986,24 @@ def _model_flow_kimi_code(config, current_model=""):
         return
 
     effective_base = creds.get("base_url") or effective_base
+
+    if not status.get("logged_in"):
+        print("  Kimi Code CLI is installed but not logged in.")
+        print("  Starting the CLI-owned login flow...")
+        try:
+            run_external_process_provider_login(provider_id)
+        except Exception as exc:
+            print(f"  ⚠ Kimi Code login failed: {exc}")
+            print("  No model configuration was changed.")
+            return
+        status = get_external_process_provider_status(provider_id)
+        if not status.get("logged_in"):
+            print(
+                "  ⚠ Kimi Code login completed, but no login marker was found. "
+                "No model configuration was changed."
+            )
+            return
+
     model_list = list(profile.fallback_models) if profile else ["k3"]
     selected = _prompt_model_selection(
         model_list,
