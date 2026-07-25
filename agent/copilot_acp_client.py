@@ -148,22 +148,11 @@ def _build_subprocess_env(provider: str = "copilot-acp") -> dict[str, str]:
     # ACP providers authenticate through their own HOME-scoped session and do
     # not receive Hermes' provider credentials. Tier-1 secrets are always
     # stripped by the central helper (#29157).
-    excluded_keys: frozenset[str] = frozenset()
     if provider == "kimi-code":
-        excluded_keys = frozenset(
-            key
-            for key in os.environ
-            if key.upper().startswith("KIMI")
-            and (
-                "ACCESS_TOKEN" in key.upper()
-                or "REFRESH_TOKEN" in key.upper()
-                or "OAUTH_TOKEN" in key.upper()
-            )
-        )
-    env = hermes_subprocess_env(
-        inherit_credentials=provider == "copilot-acp",
-        excluded_keys=excluded_keys,
-    )
+        from hermes_cli.auth import build_external_process_subprocess_env
+
+        return build_external_process_subprocess_env(provider)
+    env = hermes_subprocess_env(inherit_credentials=provider == "copilot-acp")
     home = _resolve_home_dir()
     env["HOME"] = home
     from hermes_constants import apply_subprocess_home_env
@@ -186,15 +175,30 @@ def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
     }
 
 
-def _permission_denied(message_id: Any) -> dict[str, Any]:
+def _permission_denied(
+    message_id: Any, params: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Select an offered one-shot rejection, or cancel when none is safe."""
+    options = (params or {}).get("options") or []
+    reject_option_id = next(
+        (
+            str(option.get("optionId") or "").strip()
+            for option in options
+            if isinstance(option, dict)
+            and str(option.get("kind") or "").strip() == "reject_once"
+            and str(option.get("optionId") or "").strip()
+        ),
+        "",
+    )
+    outcome = (
+        {"outcome": "selected", "optionId": reject_option_id}
+        if reject_option_id
+        else {"outcome": "cancelled"}
+    )
     return {
         "jsonrpc": "2.0",
         "id": message_id,
-        "result": {
-            "outcome": {
-                "outcome": "cancelled",
-            }
-        },
+        "result": {"outcome": outcome},
     }
 
 
@@ -472,6 +476,7 @@ class ExternalACPClient:
         command: str | None = None,
         args: list[str] | None = None,
         provider: str = "external-acp",
+        allow_file_reads: bool | None = None,
         allow_file_writes: bool = False,
         **_: Any,
     ):
@@ -494,6 +499,11 @@ class ExternalACPClient:
         self._acp_command = acp_command or command or default_command
         self._acp_args = list(acp_args or args or default_args)
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        self._allow_file_reads = (
+            provider == "copilot-acp"
+            if allow_file_reads is None
+            else allow_file_reads
+        )
         self._allow_file_writes = allow_file_writes
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
@@ -505,10 +515,13 @@ class ExternalACPClient:
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
         with self._active_process_lock:
+            self.is_closed = True
+            cancel_event = self._active_cancel_event
+            if cancel_event is not None:
+                cancel_event.set()
             proc = self._active_process
             self._active_process = None
             self._active_cancel_event = None
-        self.is_closed = True
         self._terminate_process(proc)
 
     @staticmethod
@@ -516,13 +529,37 @@ class ExternalACPClient:
         if proc is None:
             return
         try:
+            if proc.poll() is not None:
+                proc.wait(timeout=0)
+                return
+        except Exception:
+            pass
+        try:
             proc.terminate()
             proc.wait(timeout=2)
+            return
         except Exception:
             try:
                 proc.kill()
             except Exception:
                 pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+    def _finish_request(
+        self,
+        proc: subprocess.Popen[str],
+        cancel_event: threading.Event,
+    ) -> None:
+        """Release one completed request without permanently closing the client."""
+        with self._active_process_lock:
+            if self._active_cancel_event is cancel_event:
+                if self._active_process is proc:
+                    self._active_process = None
+                self._active_cancel_event = None
+        self._terminate_process(proc)
 
     def _cancel_request(self, cancel_event: threading.Event) -> None:
         """Cancel only the subprocess owned by one async request."""
@@ -549,6 +586,9 @@ class ExternalACPClient:
     ) -> Any:
         """Serialize one full ACP subprocess lifecycle per client instance."""
         with self._request_lock:
+            with self._active_process_lock:
+                if self.is_closed:
+                    raise RuntimeError(f"{self._acp_label} client is closed.")
             if _cancel_event is not None and _cancel_event.is_set():
                 raise RuntimeError(f"{self._acp_label} request was cancelled.")
             return self._create_chat_completion_locked(
@@ -646,6 +686,14 @@ class ExternalACPClient:
         model: str | None = None,
         cancel_event: threading.Event | None = None,
     ) -> tuple[str, str]:
+        request_cancel_event = cancel_event or threading.Event()
+        # Publish cancellation ownership before Popen. A close arriving while
+        # the constructor is blocked must be visible immediately after spawn.
+        with self._active_process_lock:
+            if self.is_closed:
+                raise RuntimeError(f"{self._acp_label} client is closed.")
+            self._active_process = None
+            self._active_cancel_event = request_cancel_event
         try:
             # Hide the console the CLI child would otherwise flash on Windows
             # (#56747). Hide-only — stdio pipes stay intact for the ACP wire.
@@ -663,6 +711,9 @@ class ExternalACPClient:
                 creationflags=windows_hide_flags(),
             )
         except FileNotFoundError as exc:
+            with self._active_process_lock:
+                if self._active_cancel_event is request_cancel_event:
+                    self._active_cancel_event = None
             raise RuntimeError(
                 f"Could not start {self._acp_label} command '{self._acp_command}'."
             ) from exc
@@ -674,14 +725,16 @@ class ExternalACPClient:
             )
         proc_stdin = proc.stdin
 
-        self.is_closed = False
         cancelled_before_start = False
         with self._active_process_lock:
-            if cancel_event is not None and cancel_event.is_set():
+            if (
+                request_cancel_event.is_set()
+                or self._active_cancel_event is not request_cancel_event
+            ):
                 cancelled_before_start = True
             else:
                 self._active_process = proc
-                self._active_cancel_event = cancel_event
+                self._active_cancel_event = request_cancel_event
         if cancelled_before_start:
             self._terminate_process(proc)
             raise RuntimeError(f"{self._acp_label} request was cancelled.")
@@ -721,14 +774,14 @@ class ExternalACPClient:
                 "method": method,
                 "params": params,
             }
-            if cancel_event is not None and cancel_event.is_set():
+            if request_cancel_event.is_set():
                 raise RuntimeError(f"{self._acp_label} request was cancelled.")
             proc_stdin.write(json.dumps(payload) + "\n")
             proc_stdin.flush()
 
             deadline = time.monotonic() + timeout_seconds
             while time.monotonic() < deadline:
-                if cancel_event is not None and cancel_event.is_set():
+                if request_cancel_event.is_set():
                     raise RuntimeError(f"{self._acp_label} request was cancelled.")
                 if proc.poll() is not None:
                     break
@@ -792,7 +845,7 @@ class ExternalACPClient:
                     "protocolVersion": 1,
                     "clientCapabilities": {
                         "fs": {
-                            "readTextFile": True,
+                            "readTextFile": self._allow_file_reads,
                             "writeTextFile": self._allow_file_writes,
                         }
                     },
@@ -819,9 +872,9 @@ class ExternalACPClient:
                 )
                 if not login_method:
                     raise RuntimeError(
-                        "Kimi Code CLI 0.29.1 or newer is required; this ACP "
-                        "server did not advertise its CLI-owned login method. "
-                        "Upgrade with `kimi upgrade`, then retry."
+                        "This Kimi Code ACP server did not advertise its "
+                        "CLI-owned login method. Upgrade with `kimi upgrade`, "
+                        "then retry."
                     )
                 _request("authenticate", {"methodId": login_method})
 
@@ -876,7 +929,7 @@ class ExternalACPClient:
             )
             return "".join(text_parts), "".join(reasoning_parts)
         finally:
-            self.close()
+            self._finish_request(proc, request_cancel_event)
 
     def _handle_server_message(
         self,
@@ -912,9 +965,14 @@ class ExternalACPClient:
         params = msg.get("params") or {}
 
         if method == "session/request_permission":
-            response = _permission_denied(message_id)
+            response = _permission_denied(message_id, params)
         elif method == "fs/read_text_file":
             try:
+                if not self._allow_file_reads:
+                    raise PermissionError(
+                        "Direct ACP file reads are disabled. Emit a Hermes "
+                        "tool-call block so Hermes can apply its file-safety policy."
+                    )
                 path = _ensure_path_within_cwd(str(params.get("path") or ""), cwd)
                 block_error = get_read_block_error(str(path))
                 if block_error:
