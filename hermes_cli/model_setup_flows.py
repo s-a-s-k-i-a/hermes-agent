@@ -1945,6 +1945,74 @@ def _model_flow_copilot_acp(config, current_model=""):
 
     print(f"Default model set to: {selected} (via {pconfig.name})")
 
+
+def _model_flow_kimi_code(config, current_model=""):
+    """Kimi Code OAuth/subscription flow using the local CLI's ACP server."""
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        _prompt_model_selection,
+        _save_model_choice,
+        deactivate_provider,
+        get_external_process_provider_status,
+        resolve_external_process_provider_credentials,
+    )
+    from hermes_cli.config import load_config, save_config
+    from providers import get_provider_profile
+
+    del config
+
+    provider_id = "kimi-code"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+    profile = get_provider_profile(provider_id)
+    status = get_external_process_provider_status(provider_id)
+    command = status.get("resolved_command") or status.get("command") or "kimi"
+    effective_base = status.get("base_url") or pconfig.inference_base_url
+
+    print("  Kimi Code uses the OAuth/subscription session owned by its CLI.")
+    print("  Hermes launches `kimi acp`; OAuth tokens never enter Hermes.")
+    print(f"  Command: {command}")
+    print(f"  Backend marker: {effective_base}")
+    print()
+
+    try:
+        creds = resolve_external_process_provider_credentials(provider_id)
+    except Exception as exc:
+        print(f"  ⚠ {exc}")
+        print(
+            "  Install Kimi Code CLI at ~/.kimi-code/bin/kimi, put `kimi` "
+            "on PATH, or set KIMI_CODE_CLI_PATH."
+        )
+        return
+
+    effective_base = creds.get("base_url") or effective_base
+    model_list = list(profile.fallback_models) if profile else ["k3"]
+    selected = _prompt_model_selection(
+        model_list,
+        current_model=current_model,
+        confirm_provider=provider_id,
+        confirm_base_url=effective_base,
+        confirm_api_key="",
+    )
+    if not selected:
+        print("No change.")
+        return
+
+    _save_model_choice(selected)
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = effective_base
+    model["api_mode"] = "chat_completions"
+    clear_model_endpoint_credentials(model, clear_api_mode=False)
+    save_config(cfg)
+    deactivate_provider()
+
+    print(f"Default model set to: {selected} (via {pconfig.name})")
+
+
 def _model_flow_kimi(config, current_model=""):
     """Kimi / Moonshot model selection with automatic endpoint routing.
 

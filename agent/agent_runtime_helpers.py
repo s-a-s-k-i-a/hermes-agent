@@ -1980,12 +1980,19 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
-    if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
-        from agent.copilot_acp_client import CopilotACPClient
+    from agent.copilot_acp_client import (
+        CopilotACPClient,
+        ExternalACPClient,
+        is_external_acp_runtime,
+    )
 
-        client = CopilotACPClient(**client_kwargs)
+    if is_external_acp_runtime(agent.provider, client_kwargs.get("base_url")):
+        if agent.provider == "copilot-acp":
+            client = CopilotACPClient(**client_kwargs)
+        else:
+            client = ExternalACPClient(provider=agent.provider, **client_kwargs)
         _ra().logger.info(
-            "Copilot ACP client created (%s, shared=%s) %s",
+            "External ACP client created (%s, shared=%s) %s",
             reason,
             shared,
             agent._client_log_context(),

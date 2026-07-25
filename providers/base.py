@@ -56,6 +56,22 @@ class ProviderProfile:
     auth_type: str = "api_key"   # api_key|oauth_device_code|oauth_external|copilot|aws_sdk
     supports_health_check: bool = True  # False → doctor skips /models probe for this provider
 
+    # ── External-process transport ───────────────────────────
+    # Declarative launch metadata for providers whose credentials and network
+    # access remain inside a local CLI process (for example an ACP server).
+    # Hermes resolves only the executable and argv; it never imports the
+    # process-owned OAuth tokens into its own credential stores.
+    external_command_env_vars: tuple = ()
+    external_preferred_commands: tuple = ()
+    external_default_command: str = ""
+    external_args_env_var: str = ""
+    external_default_args: tuple = ()
+    # Optional CLI-owned authentication metadata.  Hermes may invoke the
+    # login command and inspect marker *existence*, but never reads or stores
+    # the child process's credential contents.
+    external_login_args: tuple = ()
+    external_login_markers: tuple = ()
+
     # ── Vision support ────────────────────────────────────────
     # True when the provider's API accepts image content inside
     # tool-result messages natively.  Set on providers that expose

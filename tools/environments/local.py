@@ -553,7 +553,11 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
 })
 
 
-def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
+def hermes_subprocess_env(
+    *,
+    inherit_credentials: bool = False,
+    excluded_keys: frozenset[str] = frozenset(),
+) -> dict[str, str]:
     """Build a sanitized environment dict for a spawned subprocess.
 
     Centralized helper for the **non-terminal** spawn surface (browser,
@@ -585,7 +589,13 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     ``inherit_credentials=False`` and copy just those keys back from
     ``os.environ`` into the returned dict.
     """
-    env = os.environ.copy()
+    # Apply caller-specific exclusions while constructing the mapping so their
+    # values are never copied into the child-env object in the first place.
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in excluded_keys
+    }
 
     # Tier 1 — always strip.
     for key in _ALWAYS_STRIP_KEYS:

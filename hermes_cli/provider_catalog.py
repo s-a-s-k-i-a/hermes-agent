@@ -47,7 +47,7 @@ _ACCOUNTS_AUTH_TYPES: frozenset[str] = frozenset(
         "oauth_device_code",
         "oauth_external",
         "oauth_minimax",
-        "external_process",  # copilot-acp: spawns `copilot --acp --stdio`
+        "external_process",  # local CLI-owned auth, e.g. Copilot/Kimi ACP
         "copilot",           # GitHub Copilot token / gh auth
     }
 )

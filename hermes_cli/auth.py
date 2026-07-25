@@ -455,13 +455,24 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     ),
 }
 
-# Auto-extend PROVIDER_REGISTRY with any api-key provider registered in
-# providers/ that is not already declared above.  New providers only need a
-# plugins/model-providers/<name>/ plugin — no edits to this file required.
+# Auto-extend PROVIDER_REGISTRY with declarative providers registered in
+# providers/ that are not already declared above. New API-key and
+# external-process providers only need a plugin profile.
 try:
     from providers import list_providers as _list_providers_for_registry
     for _pp in _list_providers_for_registry():
         if _pp.name in PROVIDER_REGISTRY:
+            continue
+        if _pp.auth_type == "external_process":
+            PROVIDER_REGISTRY[_pp.name] = ProviderConfig(
+                id=_pp.name,
+                name=_pp.display_name or _pp.name,
+                auth_type="external_process",
+                inference_base_url=_pp.base_url,
+            )
+            for _alias in _pp.aliases:
+                if _alias not in PROVIDER_REGISTRY:
+                    PROVIDER_REGISTRY[_alias] = PROVIDER_REGISTRY[_pp.name]
             continue
         if _pp.auth_type != "api_key" or not _pp.env_vars:
             continue
@@ -6715,34 +6726,151 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _resolve_external_process_launch(provider_id: str) -> tuple[str, list[str]]:
+    """Resolve executable + argv from an external-process provider profile.
+
+    Only launch metadata crosses this boundary. Authentication remains owned
+    by the child CLI and is intentionally absent from the returned values.
+    """
+    from providers import get_provider_profile
+
+    profile = get_provider_profile(provider_id)
+    if profile is None or profile.auth_type != "external_process":
+        return "", []
+
+    command = ""
+    for env_name in profile.external_command_env_vars:
+        command = os.getenv(env_name, "").strip()
+        if command:
+            break
+
+    if not command:
+        for candidate in profile.external_preferred_commands:
+            expanded = str(
+                Path.home() / candidate[2:]
+                if candidate.startswith("~/")
+                else Path(candidate).expanduser()
+            )
+            if Path(expanded).is_file() and os.access(expanded, os.X_OK):
+                command = expanded
+                break
+
+    if not command:
+        command = profile.external_default_command
+
+    raw_args = (
+        os.getenv(profile.external_args_env_var, "").strip()
+        if profile.external_args_env_var
+        else ""
+    )
+    args = (
+        shlex.split(raw_args)
+        if raw_args
+        else [str(arg) for arg in profile.external_default_args]
+    )
+    return command, args
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    command, args = _resolve_external_process_launch(provider_id)
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
 
     resolved_command = shutil.which(command) if command else None
+    from providers import get_provider_profile
+
+    profile = get_provider_profile(provider_id)
+    marker_paths: list[str] = []
+    for raw_marker in tuple(
+        getattr(profile, "external_login_markers", ()) if profile else ()
+    ):
+        marker = str(raw_marker or "").strip()
+        if not marker:
+            continue
+        if marker.startswith("~/"):
+            marker_path = Path.home() / marker[2:]
+        else:
+            marker_path = Path(marker).expanduser()
+        marker_paths.append(str(marker_path))
+
+    installed = bool(resolved_command or base_url.startswith("acp+tcp://"))
+    logged_in = installed
+    if marker_paths:
+        logged_in = installed and any(Path(path).is_file() for path in marker_paths)
     return {
-        "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "configured": logged_in,
+        "installed": installed,
         "provider": provider_id,
         "name": pconfig.name,
         "command": command,
         "args": args,
         "resolved_command": resolved_command,
         "base_url": base_url,
-        "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "logged_in": logged_in,
+        "login_markers": marker_paths,
+        "credential_owner": f"{provider_id.removesuffix('-acp')}-cli",
     }
+
+
+def run_external_process_provider_login(provider_id: str) -> subprocess.CompletedProcess:
+    """Run a subprocess provider's own login command without importing tokens."""
+    from providers import get_provider_profile
+
+    profile = get_provider_profile(provider_id)
+    if profile is None or profile.auth_type != "external_process":
+        raise AuthError(
+            f"Provider '{provider_id}' is not an external-process provider.",
+            provider=provider_id,
+            code="invalid_provider",
+        )
+
+    command, _ = _resolve_external_process_launch(provider_id)
+    resolved_command = shutil.which(command) if command else None
+    login_args = [str(arg) for arg in profile.external_login_args]
+    if not resolved_command:
+        raise AuthError(
+            f"Could not find the external CLI command '{command}' for provider '{provider_id}'.",
+            provider=provider_id,
+            code="missing_external_process_cli",
+        )
+    if not login_args:
+        raise AuthError(
+            f"Provider '{provider_id}' does not declare a CLI login command.",
+            provider=provider_id,
+            code="missing_external_process_login",
+        )
+
+    from tools.environments.local import hermes_subprocess_env
+
+    login_excluded = frozenset(
+        key
+        for key in os.environ
+        if provider_id == "kimi-code"
+        and key.upper().startswith("KIMI")
+        and ("TOKEN" in key.upper() or "API_KEY" in key.upper())
+    )
+    login_env = hermes_subprocess_env(
+        inherit_credentials=False,
+        excluded_keys=login_excluded,
+    )
+    result = subprocess.run(
+        [resolved_command, *login_args],
+        check=False,
+        env=login_env,
+    )
+    if result.returncode != 0:
+        raise AuthError(
+            f"{provider_id} CLI login exited with status {result.returncode}.",
+            provider=provider_id,
+            code="external_process_login_failed",
+        )
+    return result
 
 
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
@@ -6762,12 +6890,12 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
-        return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
-    # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
+    if pconfig and pconfig.auth_type == "external_process":
+        return get_external_process_provider_status(target)
+    # API-key providers
     if pconfig and pconfig.auth_type == "api_key":
         return get_api_key_provider_status(target)
     # AWS SDK providers (Bedrock) — check via boto3 credential chain
@@ -6945,25 +7073,42 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    command, args = _resolve_external_process_launch(provider_id)
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider_id)
+        override_names = tuple(
+            getattr(profile, "external_command_env_vars", ()) if profile else ()
+        )
+        override_hint = (
+            f" or set {'/'.join(override_names)}" if override_names else ""
+        )
+        if provider_id == "copilot-acp":
+            message = (
+                f"Could not find the Copilot CLI command '{command}'. "
+                "Install GitHub Copilot CLI or set "
+                "HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+            )
+            code = "missing_copilot_cli"
+        else:
+            message = (
+                f"Could not find the external CLI command '{command}' for "
+                f"provider '{provider_id}'. Install its CLI{override_hint}."
+            )
+            code = "missing_external_process_cli"
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            message,
             provider=provider_id,
-            code="missing_copilot_cli",
+            code=code,
         )
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        # This non-secret sentinel keeps the established runtime credential
+        # shape without importing any OAuth material from the child process.
+        "api_key": "copilot-acp" if provider_id == "copilot-acp" else "external-process",
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,

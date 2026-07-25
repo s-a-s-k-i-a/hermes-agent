@@ -100,6 +100,16 @@ class TestInheritCredentials:
     def test_pythonutf8_set_when_inheriting(self):
         assert _build(inherit_credentials=True).get("PYTHONUTF8") == "1"
 
+    def test_caller_exclusions_apply_before_child_env_is_returned(self):
+        env = {**_SAFE_SAMPLE, "KIMI_ACCESS_TOKEN": "must-not-copy"}
+        with patch.dict(os.environ, env, clear=True):
+            result = hermes_subprocess_env(
+                inherit_credentials=True,
+                excluded_keys=frozenset({"KIMI_ACCESS_TOKEN"}),
+            )
+        assert "KIMI_ACCESS_TOKEN" not in result
+        assert result["MY_APP_VAR"] == "keep-me"
+
 
 class TestTierInvariants:
     def test_tier1_always_stripped_both_paths(self):
