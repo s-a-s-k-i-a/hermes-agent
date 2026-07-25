@@ -366,6 +366,10 @@ def test_kimi_acp_authenticates_and_sets_selected_model_before_prompt(
         )
 
     assert response.choices[0].message.content == "ok"
+    assert process.requests[0]["params"]["clientCapabilities"]["fs"] == {
+        "readTextFile": False,
+        "writeTextFile": False,
+    }
     assert [request["method"] for request in process.requests] == [
         "initialize",
         "authenticate",
@@ -410,7 +414,7 @@ def test_kimi_acp_model_selection_error_fails_closed_before_prompt(tmp_path):
     ]
 
 
-def test_kimi_acp_old_protocol_reports_minimum_supported_cli_version(tmp_path):
+def test_kimi_acp_without_login_method_reports_required_capability(tmp_path):
     from agent.copilot_acp_client import ExternalACPClient
 
     process = _ProtocolProcess(advertise_login=False)
@@ -422,12 +426,15 @@ def test_kimi_acp_old_protocol_reports_minimum_supported_cli_version(tmp_path):
     )
 
     with patch("agent.copilot_acp_client.subprocess.Popen", return_value=process):
-        with pytest.raises(RuntimeError, match=r"Kimi Code CLI 0\.29\.1 or newer"):
+        with pytest.raises(RuntimeError) as excinfo:
             client._create_chat_completion(
                 model="k3",
                 messages=[{"role": "user", "content": "hello"}],
             )
 
+    message = str(excinfo.value)
+    assert "did not advertise its CLI-owned login method" in message
+    assert "0.29.1" not in message
     assert [request["method"] for request in process.requests] == ["initialize"]
 
 
@@ -454,7 +461,9 @@ def test_copilot_acp_does_not_receive_kimi_model_configuration(tmp_path):
     assert methods == ["initialize", "session/new", "session/prompt"]
 
 
-def test_kimi_acp_denies_permission_requests_and_direct_file_writes(tmp_path):
+def test_kimi_acp_selects_offered_reject_once_for_realistic_permission_request(
+    tmp_path,
+):
     from agent.copilot_acp_client import ExternalACPClient
 
     client = ExternalACPClient(
@@ -471,7 +480,30 @@ def test_kimi_acp_denies_permission_requests_and_direct_file_writes(tmp_path):
             "jsonrpc": "2.0",
             "id": 1,
             "method": "session/request_permission",
-            "params": {},
+            "params": {
+                "sessionId": "redacted-session",
+                "toolCall": {
+                    "toolCallId": "redacted-tool-call",
+                    "title": "Bash",
+                },
+                "options": [
+                    {
+                        "optionId": "approve_once",
+                        "name": "Approve once",
+                        "kind": "allow_once",
+                    },
+                    {
+                        "optionId": "approve_always",
+                        "name": "Approve for this session",
+                        "kind": "allow_always",
+                    },
+                    {
+                        "optionId": "reject",
+                        "name": "Reject",
+                        "kind": "reject_once",
+                    },
+                ],
+            },
         },
         process=cast(Any, permission_process),
         cwd=str(tmp_path),
@@ -479,7 +511,55 @@ def test_kimi_acp_denies_permission_requests_and_direct_file_writes(tmp_path):
         reasoning_parts=[],
     )
     permission = json.loads(permission_process.stdin.getvalue())
-    assert permission["result"]["outcome"]["outcome"] == "cancelled"
+    assert permission["result"]["outcome"] == {
+        "outcome": "selected",
+        "optionId": "reject",
+    }
+
+
+def test_kimi_acp_rejects_direct_reads_of_representative_secret_file(tmp_path):
+    from agent.copilot_acp_client import ExternalACPClient
+
+    client = ExternalACPClient(
+        provider="kimi-code",
+        base_url="acp://kimi",
+        command="kimi",
+        args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+    secret = "https://user:representative-password@example.invalid"
+    target = tmp_path / ".git-credentials"
+    target.write_text(secret, encoding="utf-8")
+    read_process = _FakeProcess()
+
+    assert client._handle_server_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "fs/read_text_file",
+            "params": {"path": str(target)},
+        },
+        process=cast(Any, read_process),
+        cwd=str(tmp_path),
+        text_parts=[],
+        reasoning_parts=[],
+    )
+
+    read_response = read_process.stdin.getvalue()
+    assert "error" in json.loads(read_response)
+    assert secret not in read_response
+
+
+def test_kimi_acp_denies_direct_file_writes(tmp_path):
+    from agent.copilot_acp_client import ExternalACPClient
+
+    client = ExternalACPClient(
+        provider="kimi-code",
+        base_url="acp://kimi",
+        command="kimi",
+        args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
 
     target = tmp_path / "must-not-exist.txt"
     write_process = _FakeProcess()
@@ -500,15 +580,21 @@ def test_kimi_acp_denies_permission_requests_and_direct_file_writes(tmp_path):
     assert target.exists() is False
 
 
-def test_kimi_subprocess_preserves_home_but_strips_oauth_and_tier_one_secrets(
+def test_kimi_inference_subprocess_receives_only_minimal_declared_environment(
     monkeypatch, tmp_path
 ):
     binary = _prepare_kimi(monkeypatch, tmp_path)
     home = Path(os.environ["HOME"])
     monkeypatch.setenv("KIMI_ACCESS_TOKEN", "access-secret")
     monkeypatch.setenv("KIMI_REFRESH_TOKEN", "refresh-secret")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "unrelated-oauth-secret")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "unrelated-cloud-secret")
+    monkeypatch.setenv("AWS_PROFILE", "unrelated-cloud-profile")
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "agent.sock"))
     monkeypatch.setenv("GH_TOKEN", "tier-one-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "unrelated-provider-secret")
+    provider_home = tmp_path / "relocated-kimi"
+    monkeypatch.setenv("KIMI_CODE_HOME", str(provider_home))
 
     captured = {}
 
@@ -533,12 +619,31 @@ def test_kimi_subprocess_preserves_home_but_strips_oauth_and_tier_one_secrets(
             client._run_prompt("hello", timeout_seconds=1)
 
     assert captured["command"] == [str(binary), "acp"]
+    allowed_from_parent = {
+        "PATH",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "KIMI_CODE_HOME",
+    }
+    expected_keys = {name for name in allowed_from_parent if name in os.environ}
+    expected_keys.update({"HOME", "HERMES_REAL_HOME"})
+    assert set(captured["env"]) == expected_keys
     assert captured["env"]["HOME"] == str(home)
     assert captured["env"]["HERMES_REAL_HOME"] == str(home)
-    assert "KIMI_ACCESS_TOKEN" not in captured["env"]
-    assert "KIMI_REFRESH_TOKEN" not in captured["env"]
-    assert "GH_TOKEN" not in captured["env"]
-    assert "OPENAI_API_KEY" not in captured["env"]
+    assert captured["env"]["KIMI_CODE_HOME"] == str(provider_home)
 
 
 def test_external_acp_async_facade_offloads_blocking_completion():
@@ -684,6 +789,155 @@ def test_async_cancellation_terminates_its_active_acp_child(tmp_path):
             assert stopped
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reason", ["interrupt_abort", "stale_call_kill"])
+def test_primary_abort_path_terminates_and_reaps_external_acp_child(
+    tmp_path, reason
+):
+    from agent.copilot_acp_client import ExternalACPClient
+    from run_agent import AIAgent
+
+    class TrackingProcess(_ProtocolProcess):
+        def __init__(self):
+            super().__init__()
+            self.terminated = False
+            self.waited = False
+
+        def terminate(self):
+            self.terminated = True
+            super().terminate()
+
+        def wait(self, timeout=None):
+            self.waited = True
+            return super().wait(timeout=timeout)
+
+    process = TrackingProcess()
+    client = ExternalACPClient(
+        provider="kimi-code",
+        command="kimi",
+        args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+    with client._active_process_lock:
+        client._active_process = cast(Any, process)
+        client._active_cancel_event = threading.Event()
+
+    agent = cast(Any, object.__new__(AIAgent))
+    agent.provider = "kimi-code"
+    agent.model = "k3"
+    agent.base_url = "acp://kimi"
+
+    AIAgent._abort_request_openai_client(agent, client, reason=reason)
+
+    assert process.terminated is True
+    assert process.waited is True
+    assert client._active_process is None
+
+
+def test_close_during_spawn_registration_gap_terminates_and_reaps_child(tmp_path):
+    from agent.copilot_acp_client import ExternalACPClient
+
+    spawn_started = threading.Event()
+    release_spawn = threading.Event()
+
+    class GapProcess(_ProtocolProcess):
+        def __init__(self):
+            super().__init__()
+            self.terminated = threading.Event()
+            self.waited = threading.Event()
+            # Never answer initialize unless cancellation terminates the child.
+            self.stdin = io.StringIO()
+
+        def terminate(self):
+            self.terminated.set()
+            super().terminate()
+
+        def wait(self, timeout=None):
+            self.waited.set()
+            return super().wait(timeout=timeout)
+
+    process = GapProcess()
+
+    def fake_popen(*_args, **_kwargs):
+        spawn_started.set()
+        assert release_spawn.wait(timeout=1)
+        return process
+
+    client = ExternalACPClient(
+        provider="kimi-code",
+        command="kimi",
+        args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+    result = {}
+
+    def run_prompt():
+        try:
+            client._run_prompt("wait", timeout_seconds=5)
+        except Exception as exc:
+            result["error"] = exc
+
+    with patch("agent.copilot_acp_client.subprocess.Popen", side_effect=fake_popen):
+        worker = threading.Thread(target=run_prompt)
+        worker.start()
+        assert spawn_started.wait(timeout=1)
+        client.close()
+        release_spawn.set()
+        worker.join(timeout=1)
+        if worker.is_alive():
+            client.close()
+            worker.join(timeout=1)
+
+    assert worker.is_alive() is False
+    assert process.terminated.is_set()
+    assert process.waited.is_set()
+    assert "cancel" in str(result.get("error", "")).lower()
+
+
+def test_close_before_prompt_start_prevents_child_spawn(tmp_path):
+    from agent.copilot_acp_client import ExternalACPClient
+
+    client = ExternalACPClient(
+        provider="kimi-code",
+        command="kimi",
+        args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+    client.close()
+
+    with patch("agent.copilot_acp_client.subprocess.Popen") as popen:
+        with pytest.raises(RuntimeError, match="closed|cancelled"):
+            client._run_prompt("must not spawn", timeout_seconds=1)
+
+    popen.assert_not_called()
+
+
+def test_external_acp_client_supports_sequential_requests(tmp_path):
+    from agent.copilot_acp_client import ExternalACPClient
+
+    processes = [_ProtocolProcess(), _ProtocolProcess()]
+    client = ExternalACPClient(
+        provider="kimi-code",
+        command="kimi",
+        args=["acp"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with patch(
+        "agent.copilot_acp_client.subprocess.Popen", side_effect=processes
+    ):
+        first = client._create_chat_completion(
+            model="k3", messages=[{"role": "user", "content": "first"}]
+        )
+        second = client._create_chat_completion(
+            model="k3", messages=[{"role": "user", "content": "second"}]
+        )
+
+    assert first.choices[0].message.content == "ok"
+    assert second.choices[0].message.content == "ok"
+    assert client.is_closed is False
+    assert all(process.poll() == 0 for process in processes)
 
 
 def test_external_acp_redacts_and_bounds_child_stderr(tmp_path):

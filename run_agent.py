@@ -4680,9 +4680,21 @@ class AIAgent:
         Here we only ``shutdown(SHUT_RDWR)`` the pool's sockets. That unblocks
         the owning worker thread's pending ``recv``/``send`` with an EOF or
         ``EPIPE`` so it can unwind and close ``client`` from its own context
-        — which is where the FD release belongs.
+        — which is where the FD release belongs. Stdio ACP request clients are
+        the exception: they own a child process rather than TCP sockets, so
+        their request-scoped close path signals cancellation and reaps it.
         """
         if client is None:
+            return
+        from agent.copilot_acp_client import ExternalACPClient
+
+        if isinstance(client, ExternalACPClient):
+            client.close()
+            logger.info(
+                "External ACP client aborted (%s, child_reaped=True) %s",
+                reason,
+                self._client_log_context(),
+            )
             return
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
