@@ -24,7 +24,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **NovitaAI** | `NOVITA_API_KEY` in `~/.hermes/.env` (provider: `novita`, 200+ models, Model API, Agent Sandbox, GPU Cloud) |
 | **z.ai / GLM** | `GLM_API_KEY` in `~/.hermes/.env` (provider: `zai`) |
 | **Kimi / Moonshot** | `KIMI_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding`) |
-| **Kimi Code CLI** | `kimi login`, then `hermes model --provider kimi-code --model k3` (OAuth/subscription; Kimi Code CLI 0.29.1+) |
+| **Kimi Code CLI** | `kimi login`, then `hermes model --provider kimi-code --model k3` (OAuth/subscription) |
 | **Kimi / Moonshot (China)** | `KIMI_CN_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding-cn`; aliases: `kimi-cn`, `moonshot-cn`) |
 | **Arcee AI** | `ARCEEAI_API_KEY` in `~/.hermes/.env` (provider: `arcee`; aliases: `arcee-ai`, `arceeai`) |
 | **GMI Cloud** | `GMI_API_KEY` in `~/.hermes/.env` (provider: `gmi`; aliases: `gmi-cloud`, `gmicloud`) |
@@ -213,13 +213,13 @@ model:
 
 ### Kimi Code CLI (OAuth / Subscription)
 
-The `kimi-code` provider uses the OAuth session already owned by the local [Kimi Code CLI](https://moonshotai.github.io/kimi-code/). Hermes starts `kimi acp` as a short-lived subprocess and authenticates through the ACP login method; OAuth access and refresh tokens are never copied into Hermes config, `.env`, or `auth.json`.
+The `kimi-code` provider uses the OAuth session already owned by the local [Kimi Code CLI](https://moonshotai.github.io/kimi-code/). Hermes setup runs the CLI's own `kimi login` command when authentication is needed. During inference Hermes starts `kimi acp` as a short-lived subprocess and uses the login method advertised by that ACP server to activate the existing CLI session; OAuth access and refresh tokens are never copied into Hermes config, `.env`, or `auth.json`.
 
-Kimi Code CLI **0.29.1 or newer** is required:
+Install a Kimi Code CLI release whose ACP server advertises the required login and model-configuration methods. Hermes checks those capabilities directly instead of relying on an unverified version cutoff:
 
 ```bash
 kimi --version
-kimi upgrade                 # if the installed version is older
+kimi upgrade                 # if the required ACP methods are unavailable
 kimi login                   # one-time device-code login owned by Kimi Code
 
 hermes auth status kimi-code
@@ -227,9 +227,11 @@ hermes model --provider kimi-code --model k3
 hermes -z "Hello from Kimi Code"
 ```
 
-The provider supports `k3` and `k3-256k`. `hermes model` starts `kimi login` automatically when the CLI is installed but logged out; if login does not complete, Hermes leaves the existing model configuration unchanged. `hermes doctor` reports the executable and CLI session-marker state.
+The provider supports `k3` and `k3-256k`. `hermes model` starts `kimi login` automatically when the CLI is installed but logged out; if login does not complete, Hermes leaves the existing model configuration unchanged. `hermes doctor` reports the executable and CLI session-marker state. Set `KIMI_CODE_HOME` to relocate the CLI data root; status, doctor, login postchecks, inference, and logout all use that root.
 
-For safety, Hermes denies permission and direct filesystem requests initiated by the external ACP process. Kimi can still use normal Hermes tools by returning Hermes tool-call markup, so tool execution remains subject to Hermes's own approval and file-safety policies.
+For safety, the Kimi child receives a minimal environment (`HOME`, `PATH`, process-essential temp/locale variables, and `KIMI_CODE_HOME` when set), advertises no filesystem-read capability, and rejects permission and direct filesystem requests initiated by ACP. Kimi can still use normal Hermes tools by returning Hermes tool-call markup, so tool execution remains subject to Hermes's own approval and file-safety policies.
+
+Kimi Code CLI 0.29.1 does not expose a logout subcommand. `hermes auth logout kimi-code` therefore removes only Kimi's provider-owned `credentials/kimi-code.json` login marker under the effective Kimi data root; it does not run an undocumented command or inspect credential contents.
 
 :::tip Kimi Code CLI vs Kimi API key
 `kimi-code` uses an existing Kimi Code subscription and CLI-owned OAuth session. `kimi-coding` and `kimi-coding-cn` call Moonshot's API directly with `KIMI_API_KEY` or `KIMI_CN_API_KEY`; those are separately billed API-key providers.

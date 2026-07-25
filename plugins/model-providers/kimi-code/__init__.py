@@ -37,8 +37,12 @@ kimi_code = KimiCodeProfile(
     external_preferred_commands=("~/.kimi-code/bin/kimi",),
     external_default_command="kimi",
     external_default_args=("acp",),
+    external_process_env_vars=("KIMI_CODE_HOME",),
+    external_data_root_env_var="KIMI_CODE_HOME",
+    external_default_data_root="~/.kimi-code",
     external_login_args=("login",),
-    external_login_markers=("~/.kimi-code/credentials/kimi-code.json",),
+    external_login_markers=("credentials/kimi-code.json",),
+    external_logout_removes_login_markers=True,
 )
 
 register_provider(kimi_code)
