@@ -24,6 +24,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **NovitaAI** | `NOVITA_API_KEY` in `~/.hermes/.env` (provider: `novita`, 200+ models, Model API, Agent Sandbox, GPU Cloud) |
 | **z.ai / GLM** | `GLM_API_KEY` in `~/.hermes/.env` (provider: `zai`) |
 | **Kimi / Moonshot** | `KIMI_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding`) |
+| **Kimi Code CLI** | `kimi login`, then `hermes model --provider kimi-code --model k3` (OAuth/subscription; Kimi Code CLI 0.29.1+) |
 | **Kimi / Moonshot (China)** | `KIMI_CN_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding-cn`; aliases: `kimi-cn`, `moonshot-cn`) |
 | **Arcee AI** | `ARCEEAI_API_KEY` in `~/.hermes/.env` (provider: `arcee`; aliases: `arcee-ai`, `arceeai`) |
 | **GMI Cloud** | `GMI_API_KEY` in `~/.hermes/.env` (provider: `gmi`; aliases: `gmi-cloud`, `gmicloud`) |
@@ -209,6 +210,30 @@ model:
 | `COPILOT_GITHUB_TOKEN` | GitHub token for Copilot API (first priority) |
 | `HERMES_COPILOT_ACP_COMMAND` | Override the Copilot CLI binary path (default: `copilot`) |
 | `HERMES_COPILOT_ACP_ARGS` | Override ACP args (default: `--acp --stdio`) |
+
+### Kimi Code CLI (OAuth / Subscription)
+
+The `kimi-code` provider uses the OAuth session already owned by the local [Kimi Code CLI](https://moonshotai.github.io/kimi-code/). Hermes starts `kimi acp` as a short-lived subprocess and authenticates through the ACP login method; OAuth access and refresh tokens are never copied into Hermes config, `.env`, or `auth.json`.
+
+Kimi Code CLI **0.29.1 or newer** is required:
+
+```bash
+kimi --version
+kimi upgrade                 # if the installed version is older
+kimi login                   # one-time device-code login owned by Kimi Code
+
+hermes auth status kimi-code
+hermes model --provider kimi-code --model k3
+hermes -z "Hello from Kimi Code"
+```
+
+The provider supports `k3` and `k3-256k`. `hermes model` starts `kimi login` automatically when the CLI is installed but logged out; if login does not complete, Hermes leaves the existing model configuration unchanged. `hermes doctor` reports the executable and CLI session-marker state.
+
+For safety, Hermes denies permission and direct filesystem requests initiated by the external ACP process. Kimi can still use normal Hermes tools by returning Hermes tool-call markup, so tool execution remains subject to Hermes's own approval and file-safety policies.
+
+:::tip Kimi Code CLI vs Kimi API key
+`kimi-code` uses an existing Kimi Code subscription and CLI-owned OAuth session. `kimi-coding` and `kimi-coding-cn` call Moonshot's API directly with `KIMI_API_KEY` or `KIMI_CN_API_KEY`; those are separately billed API-key providers.
+:::
 
 ### First-Class API-Key Providers
 
