@@ -223,6 +223,210 @@ def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None
     issues.append(fix)
 
 
+def _redacted_error_text(exc: object) -> str:
+    """Scrub an exception message before it reaches doctor output."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(str(exc), force=True)
+    except Exception:
+        return exc.__class__.__name__
+
+
+def _primary_provider_is_external_process() -> bool:
+    """True when config's primary provider is an external-process provider.
+
+    Deliberately narrow: only the *configured primary*, only the canonical
+    provider contract ``auth_type == "external_process"``.  Used to keep
+    doctor's ``.env`` section from demanding API keys that an external-process
+    provider never uses — its credentials live in the provider CLI, not in
+    Hermes.  Intentionally status-free: whether the CLI is installed or
+    logged in is diagnosed separately by ``external_process_provider_checks``,
+    and the legacy status helper's ``logged_in`` cannot be trusted for
+    marker-less providers anyway.
+    """
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+        model_cfg = config.get("model")
+        if not isinstance(model_cfg, dict):
+            return False
+        primary = _canonical_provider_id(model_cfg.get("provider"))
+        if not primary:
+            return False
+        pconfig = PROVIDER_REGISTRY.get(primary)
+        return bool(pconfig) and pconfig.auth_type == "external_process"
+    except Exception:
+        return False
+
+
+def _canonical_provider_id(name: object) -> str:
+    """Canonicalize a provider reference through the existing normalizers.
+
+    ``hermes_cli.providers.normalize_provider`` resolves CLI-level aliases
+    (e.g. ``github-copilot-acp``); the provider-profile alias table resolves
+    plugin-declared aliases (e.g. ``copilot-acp-agent``).  No new alias
+    knowledge lives here.
+    """
+    raw = str(name or "").strip().lower()
+    if not raw:
+        return ""
+    try:
+        from hermes_cli.providers import normalize_provider
+
+        canonical = normalize_provider(raw)
+    except Exception:
+        canonical = raw
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(canonical)
+        if profile is not None:
+            return profile.name
+    except Exception:
+        pass
+    return canonical
+
+
+def _external_process_referenced_providers() -> set[str]:
+    """Canonical provider ids referenced by config as primary or fallback."""
+    referenced: set[str] = set()
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        config = load_config() or {}
+        model_cfg = config.get("model")
+        if isinstance(model_cfg, dict):
+            primary = _canonical_provider_id(model_cfg.get("provider"))
+            if primary:
+                referenced.add(primary)
+        for entry in get_fallback_chain(config):
+            provider = _canonical_provider_id(entry.get("provider"))
+            if provider:
+                referenced.add(provider)
+    except Exception:
+        pass
+    return referenced
+
+
+def external_process_provider_checks() -> None:
+    """Diagnose external-process (ACP) providers structurally.
+
+    Driven by ``PROVIDER_REGISTRY`` entries with
+    ``auth_type == "external_process"`` so every registered ACP provider
+    (copilot-acp, kimi-code, future ones) is covered without special
+    cases.  Purely structural: executable resolution and login-marker
+    *existence* — never an HTTP probe, never reading marker contents,
+    never printing secret values.
+
+    Noise guard: a registered plugin whose CLI is neither installed nor
+    logged in AND that is not referenced by config (``model.provider`` or
+    ``fallback_providers``) is skipped — an unused missing CLI is not a
+    problem.  Prints nothing when no relevant provider remains.
+    """
+    try:
+        from hermes_cli.auth import (
+            PROVIDER_REGISTRY,
+            get_external_process_provider_status,
+        )
+
+        referenced = _external_process_referenced_providers()
+
+        seen: set[str] = set()
+        rows = []
+        for provider_id, pconfig in PROVIDER_REGISTRY.items():
+            if pconfig.auth_type != "external_process":
+                continue
+            # Aliases share one canonical provider — report once, keyed by
+            # canonical id so an alias registry entry never shadows (or
+            # swallows) the canonical row's relevance check.
+            canonical_id = _canonical_provider_id(provider_id) or provider_id
+            if canonical_id in seen:
+                continue
+            seen.add(canonical_id)
+            try:
+                status = get_external_process_provider_status(canonical_id) or {}
+            except Exception as exc:
+                status = {"error": exc}
+            is_relevant = (
+                canonical_id in referenced
+                or bool(status.get("installed"))
+                or bool(status.get("logged_in"))
+            )
+            if not is_relevant:
+                continue
+            rows.append((canonical_id, pconfig, status))
+        if not rows:
+            return
+
+        _section("External-Process Providers")
+        for provider_id, pconfig, status in rows:
+            if "error" in status:
+                check_warn(
+                    f"{pconfig.name}",
+                    f"(status check failed: {_redacted_error_text(status['error'])})",
+                )
+                continue
+            # Command values (resolved paths) never appear in doctor output:
+            # the central redactor intentionally skips token-shaped path
+            # segments, so the only safe treatment is omission.
+            if status.get("logged_in"):
+                if status.get("login_markers"):
+                    check_ok(
+                        f"{pconfig.name}",
+                        "(CLI found, session marker present)",
+                    )
+                else:
+                    # No login markers declared — the legacy helper reports
+                    # logged_in == installed, which verifies nothing. Do not
+                    # claim verified readiness.
+                    check_warn(
+                        f"{pconfig.name}",
+                        "(CLI found; login state not verifiable)",
+                    )
+            elif status.get("installed"):
+                check_warn(
+                    f"{pconfig.name}",
+                    "(CLI found but no login marker)",
+                )
+                check_info(
+                    f"Run 'hermes auth add {provider_id}' "
+                    "(runs the CLI's own login)"
+                )
+            else:
+                check_warn(
+                    f"{pconfig.name}",
+                    "(CLI not found)",
+                )
+                override_names: tuple = ()
+                try:
+                    from providers import get_provider_profile
+
+                    profile = get_provider_profile(provider_id)
+                    override_names = tuple(
+                        getattr(profile, "external_command_env_vars", ())
+                        if profile
+                        else ()
+                    )
+                except Exception:
+                    override_names = ()
+                if override_names:
+                    check_info(
+                        "Install the provider's CLI or set "
+                        f"{'/'.join(override_names)} to its executable path"
+                    )
+                else:
+                    check_info("Install the provider's CLI and ensure it is on PATH")
+    except Exception as exc:
+        # Diagnostics must never crash doctor.
+        check_warn(
+            f"External-process provider check failed: {_redacted_error_text(exc)}"
+        )
+
+
 # Deprecated / legacy config keys still read for back-compat. Doctor surfaces
 # them as non-failing warnings with the modern replacement — it does not
 # auto-migrate or delete (migrations live in config.py version steps).
@@ -903,6 +1107,11 @@ def run_doctor(args):
     _section("Configuration Files")
     # Managed scope (administrator-pinned config/env), when present.
     managed_scope_check()
+    # An external-process primary never uses Hermes API keys in .env — its
+    # credentials live in the provider CLI's own auth flow.  Contract-based
+    # only: no claim about whether that CLI session actually exists (auth
+    # readiness is diagnosed in the External-Process Providers section).
+    _external_process_primary = _primary_provider_is_external_process()
     # Check ~/.hermes/.env (primary location for user config)
     env_path = HERMES_HOME / '.env'
     if env_path.exists():
@@ -917,6 +1126,11 @@ def run_doctor(args):
             content = env_path.read_text(encoding="latin-1")
         if _has_provider_env_config(content):
             check_ok("API key or custom endpoint configured")
+        elif _external_process_primary:
+            check_ok(
+                "No API key in .env",
+                "(not needed — external-process primary uses its own CLI authentication)",
+            )
         else:
             check_warn(f"No API key found in {_DHH}/.env")
             issues.append("Run 'hermes setup' to configure API keys")
@@ -925,6 +1139,11 @@ def run_doctor(args):
         fallback_env = PROJECT_ROOT / '.env'
         if fallback_env.exists():
             check_ok(".env file exists (in project directory)")
+        elif _external_process_primary:
+            check_ok(
+                f"{_DHH}/.env not present",
+                "(optional — external-process primary does not use Hermes API keys)",
+            )
         else:
             check_fail(f"{_DHH}/.env file missing")
             if should_fix:
@@ -1407,6 +1626,10 @@ def run_doctor(args):
                 check_info(xai_oauth_status["error"])
     except Exception:
         pass
+
+    # External-process (ACP) providers — structural diagnostics only,
+    # registry-driven; prints nothing when none are registered.
+    external_process_provider_checks()
 
     _section("Directory Structure")
     hermes_home = HERMES_HOME
