@@ -450,7 +450,7 @@ def init_agent(
     api_key: str = None,
     provider: str = None,
     api_mode: str = None,
-    acp_command: str = None,
+    acp_command: str | None = None,
     acp_args: list[str] | None = None,
     command: str = None,
     args: list[str] | None = None,
@@ -688,7 +688,7 @@ def init_agent(
     # providers have exceptions (for example Copilot's gpt-5-mini still
     # uses chat completions). Also auto-upgrade for direct OpenAI URLs
     # (api.openai.com) since all newer tool-calling models prefer
-    # Responses there. ACP runtimes are excluded: CopilotACPClient
+    # Responses there. External ACP runtimes are excluded: their local client
     # handles its own routing and does not implement the Responses API
     # surface.
     # When api_mode was explicitly provided, respect it — the user
@@ -699,9 +699,7 @@ def init_agent(
     if (
         api_mode is None
         and agent.api_mode == "chat_completions"
-        and agent.provider != "copilot-acp"
-        and not str(agent.base_url or "").lower().startswith("acp://copilot")
-        and not str(agent.base_url or "").lower().startswith("acp+tcp://")
+        and not agent._uses_non_streaming_runtime()
         and not agent._is_azure_openai_url()
         and (
             agent._is_direct_openai_url()
@@ -1109,6 +1107,7 @@ def init_agent(
             _gr_label = " + Guardrails" if agent._bedrock_guardrail_config else ""
             print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock, {agent._bedrock_region}{_gr_label})")
     else:
+        client_kwargs: Dict[str, Any]
         if api_key and base_url:
             # Explicit credentials from CLI/gateway — construct directly.
             # The runtime provider resolver already handled auth for us.
@@ -1130,7 +1129,7 @@ def init_agent(
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
-            if agent.provider == "copilot-acp":
+            if agent._uses_non_streaming_runtime():
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
             effective_base = base_url
@@ -1176,6 +1175,13 @@ def init_agent(
                     "api_key": _routed_client.api_key,
                     "base_url": str(_routed_client.base_url),
                 }
+                if agent._uses_non_streaming_runtime():
+                    client_kwargs["command"] = getattr(
+                        _routed_client, "_acp_command", agent.acp_command
+                    )
+                    client_kwargs["args"] = list(
+                        getattr(_routed_client, "_acp_args", agent.acp_args) or []
+                    )
                 if _provider_timeout is not None:
                     client_kwargs["timeout"] = _provider_timeout
                 # Preserve provider-specific headers the router set.  The
@@ -1235,6 +1241,16 @@ def init_agent(
                                 "api_key": _fb_client.api_key,
                                 "base_url": str(_fb_client.base_url),
                             }
+                            if agent._uses_non_streaming_runtime():
+                                agent.api_mode = "chat_completions"
+                                agent.acp_command = getattr(
+                                    _fb_client, "_acp_command", None
+                                )
+                                agent.acp_args = list(
+                                    getattr(_fb_client, "_acp_args", []) or []
+                                )
+                                client_kwargs["command"] = agent.acp_command
+                                client_kwargs["args"] = agent.acp_args
                             if _provider_timeout is not None:
                                 client_kwargs["timeout"] = _provider_timeout
                             _fb_headers = getattr(_fb_client, "_custom_headers", None)

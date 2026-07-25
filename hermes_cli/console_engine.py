@@ -1247,7 +1247,22 @@ def _apply_confirmed_defaults(args: argparse.Namespace) -> None:
     if getattr(args, "auth_action", None) == "add":
         auth_type = getattr(args, "auth_type", None)
         if auth_type in {"api-key", "api_key"} and not getattr(args, "api_key", None):
-            raise ConsoleCommandError("auth add --type api-key requires --api-key in Hermes Console.")
+            # External-process providers own their authentication state.  Their
+            # auth command intentionally ignores ``--type api-key`` and launches
+            # the provider CLI login flow, so the console must not demand a
+            # secret that Hermes is forbidden to store.
+            provider_id = str(getattr(args, "provider", "") or "").strip().lower()
+            try:
+                from hermes_cli.auth import PROVIDER_REGISTRY
+
+                provider_cfg = PROVIDER_REGISTRY.get(provider_id)
+                is_external = bool(
+                    provider_cfg and provider_cfg.auth_type == "external_process"
+                )
+            except Exception:
+                is_external = False
+            if not is_external:
+                raise ConsoleCommandError("auth add --type api-key requires --api-key in Hermes Console.")
     if getattr(args, "import_name", None) is not None:
         # profile import has no prompt flag; leave it alone.
         return

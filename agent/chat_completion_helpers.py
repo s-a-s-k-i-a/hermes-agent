@@ -1743,7 +1743,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         fb_api_mode = "chat_completions"
         fb_base_url = str(fb_client.base_url)
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
-        if fb_provider == "openai-codex":
+        from agent.copilot_acp_client import is_external_acp_runtime
+
+        _fb_is_external_acp = is_external_acp_runtime(
+            fb_provider, fb_base_url
+        )
+        if _fb_is_external_acp:
+            fb_api_mode = "chat_completions"
+        elif fb_provider == "openai-codex":
             fb_api_mode = "codex_responses"
         elif (
             fb_provider == "anthropic"
@@ -1869,6 +1876,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "base_url": fb_base_url,
                 **({"default_headers": dict(fb_headers)} if fb_headers else {}),
             }
+            if _fb_is_external_acp:
+                agent.acp_command = getattr(fb_client, "_acp_command", None)
+                agent.acp_args = list(getattr(fb_client, "_acp_args", []) or [])
+                agent._client_kwargs["command"] = agent.acp_command
+                agent._client_kwargs["args"] = agent.acp_args
             if _fb_timeout is not None:
                 agent._client_kwargs["timeout"] = _fb_timeout
                 # Rebuild the shared OpenAI client so the configured

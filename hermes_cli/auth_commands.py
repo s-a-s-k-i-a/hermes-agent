@@ -166,6 +166,15 @@ def auth_add_command(args) -> None:
     if provider not in PROVIDER_REGISTRY and provider != "openrouter" and not provider.startswith(CUSTOM_POOL_PREFIX):
         raise SystemExit(f"Unknown provider: {provider}")
 
+    # Subprocess-backed providers own their OAuth session.  This branch must
+    # precede requested auth-type parsing and pool loading so even an explicit
+    # ``--type api-key`` cannot prompt for or persist a token in Hermes.
+    provider_config = PROVIDER_REGISTRY.get(provider)
+    if provider_config and provider_config.auth_type == "external_process":
+        auth_mod.run_external_process_provider_login(provider)
+        print(f"{provider} login completed in its own CLI; Hermes stored no credential.")
+        return
+
     requested_type = str(getattr(args, "auth_type", "") or "").strip().lower()
     if requested_type in {AUTH_TYPE_API_KEY, "api-key"}:
         requested_type = AUTH_TYPE_API_KEY

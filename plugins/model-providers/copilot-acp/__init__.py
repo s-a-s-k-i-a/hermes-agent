@@ -30,6 +30,14 @@ copilot_acp = CopilotACPProfile(
     env_vars=(),  # Managed by ACP subprocess
     base_url="acp://copilot",  # ACP internal scheme
     auth_type="external_process",
+    supports_health_check=False,
+    external_command_env_vars=(
+        "HERMES_COPILOT_ACP_COMMAND",
+        "COPILOT_CLI_PATH",
+    ),
+    external_default_command="copilot",
+    external_args_env_var="HERMES_COPILOT_ACP_ARGS",
+    external_default_args=("--acp", "--stdio"),
 )
 
 register_provider(copilot_acp)

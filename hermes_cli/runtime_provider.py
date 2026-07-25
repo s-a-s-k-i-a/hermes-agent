@@ -1660,6 +1660,21 @@ def resolve_runtime_provider(
                 f"(providers.{requested_provider}.enabled: false)"
             )
 
+    external_config = PROVIDER_REGISTRY.get(requested_provider)
+    if external_config and external_config.auth_type == "external_process":
+        provider = external_config.id
+        creds = resolve_external_process_provider_credentials(provider)
+        return {
+            "provider": provider,
+            "api_mode": "chat_completions",
+            "base_url": creds.get("base_url", "").rstrip("/"),
+            "api_key": creds.get("api_key", ""),
+            "command": creds.get("command", ""),
+            "args": list(creds.get("args") or []),
+            "source": creds.get("source", "process"),
+            "requested_provider": requested_provider,
+        }
+
     if requested_provider == "moa":
         return {
             "provider": "moa",
@@ -1980,19 +1995,6 @@ def resolve_runtime_provider(
                 "source": creds.get("source", "oauth"),
                 "requested_provider": requested_provider,
             }
-
-    if provider == "copilot-acp":
-        creds = resolve_external_process_provider_credentials(provider)
-        return {
-            "provider": "copilot-acp",
-            "api_mode": "chat_completions",
-            "base_url": creds.get("base_url", "").rstrip("/"),
-            "api_key": creds.get("api_key", ""),
-            "command": creds.get("command", ""),
-            "args": list(creds.get("args") or []),
-            "source": creds.get("source", "process"),
-            "requested_provider": requested_provider,
-        }
 
     # Anthropic (native Messages API)
     if provider == "anthropic":

@@ -92,13 +92,15 @@ def test_both_kimi_providers_appear_when_both_keys_set():
     )
     assert cn["is_current"] is False  # `current_provider` is kimi-coding
 
-    # Exactly 2 Kimi entries — no duplicates for aliases (kimi, moonshot,
-    # moonshot-cn, kimi-cn)
-    kimi_slugs = [p["slug"] for p in providers if "kimi" in p["slug"] or "moonshot" in p["slug"]]
-    assert len(kimi_slugs) == 2, (
-        f"Expected exactly 2 Kimi entries (kimi-coding, kimi-coding-cn), "
-        f"got {kimi_slugs}"
-    )
+    # Exactly the two API-key Kimi entries.  The separate `kimi-code`
+    # provider is a legitimate third row backed by CLI-owned OAuth, not an
+    # alias of either Moonshot API endpoint.
+    kimi_api_slugs = [
+        p["slug"]
+        for p in providers
+        if p["slug"] in {"kimi-coding", "kimi-coding-cn"}
+    ]
+    assert sorted(kimi_api_slugs) == ["kimi-coding", "kimi-coding-cn"]
 
 
 # -- Both aliases deduped correctly ------------------------------------------

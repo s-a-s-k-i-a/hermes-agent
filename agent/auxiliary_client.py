@@ -1704,8 +1704,8 @@ def _maybe_wrap_anthropic(
     except ImportError:
         pass
     try:
-        from agent.copilot_acp_client import CopilotACPClient
-        if _safe_isinstance(client_obj, CopilotACPClient):
+        from agent.copilot_acp_client import ExternalACPClient
+        if _safe_isinstance(client_obj, ExternalACPClient):
             return client_obj
     except ImportError:
         pass
@@ -4808,9 +4808,9 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     except ImportError:
         pass
     try:
-        from agent.copilot_acp_client import CopilotACPClient
-        if isinstance(sync_client, CopilotACPClient):
-            return sync_client, model
+        from agent.copilot_acp_client import AsyncExternalACPClient, ExternalACPClient
+        if isinstance(sync_client, ExternalACPClient):
+            return AsyncExternalACPClient(sync_client), model
     except ImportError:
         pass
 
@@ -5489,45 +5489,60 @@ def resolve_provider_client(
 
     if pconfig.auth_type == "external_process":
         creds = resolve_external_process_provider_credentials(provider)
+        try:
+            from providers import get_provider_profile
+
+            _external_profile = get_provider_profile(provider)
+            _external_default_model = (
+                _external_profile.default_aux_model if _external_profile else ""
+            )
+        except Exception:
+            _external_default_model = ""
         final_model = _normalize_resolved_model(
             model
+            or _external_default_model
             or (main_runtime.get("model") if main_runtime else None)
             or _read_main_model_for_aux(),
             provider,
         )
-        if provider == "copilot-acp":
-            api_key = str(creds.get("api_key", "")).strip()
-            base_url = str(creds.get("base_url", "")).strip()
-            command = str(creds.get("command", "")).strip() or None
-            args = list(creds.get("args") or [])
-            if not final_model:
-                logger.warning(
-                    "resolve_provider_client: copilot-acp requested but no model "
-                    "was provided or configured"
-                )
-                return None, None
-            if not api_key or not base_url:
-                logger.warning(
-                    "resolve_provider_client: copilot-acp requested but external "
-                    "process credentials are incomplete"
-                )
-                return None, None
-            from agent.copilot_acp_client import CopilotACPClient
+        api_key = str(creds.get("api_key", "")).strip()
+        base_url = str(creds.get("base_url", "")).strip()
+        command = str(creds.get("command", "")).strip() or None
+        args = list(creds.get("args") or [])
+        if not final_model:
+            logger.warning(
+                "resolve_provider_client: %s requested but no model was "
+                "provided or configured",
+                provider,
+            )
+            return None, None
+        if not api_key or not base_url:
+            logger.warning(
+                "resolve_provider_client: %s requested but external process "
+                "details are incomplete",
+                provider,
+            )
+            return None, None
+        from agent.copilot_acp_client import CopilotACPClient, ExternalACPClient
 
+        if provider == "copilot-acp":
             client = CopilotACPClient(
                 api_key=api_key,
                 base_url=base_url,
                 command=command,
                 args=args,
             )
-            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
-            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
-                    else (client, final_model))
-        if provider not in _LOGGED_UNSUPPORTED_EXTPROC_KEYS:
-            _LOGGED_UNSUPPORTED_EXTPROC_KEYS.add(provider)
-            logger.debug("resolve_provider_client: external-process provider %s not "
-                         "directly supported", provider)
-        return None, None
+        else:
+            client = ExternalACPClient(
+                provider=provider,
+                api_key=api_key,
+                base_url=base_url,
+                command=command,
+                args=args,
+            )
+        logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                else (client, final_model))
 
     elif pconfig.auth_type == "vertex":
         # Google Vertex AI — Gemini via the OpenAI-compatible endpoint with an
@@ -6598,6 +6613,7 @@ def _resolve_task_provider_model(
                 "anthropic",
                 "copilot",
                 "copilot-acp",
+                "kimi-code",
                 "minimax-oauth",
                 "nous",
                 "openai-codex",

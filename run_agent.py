@@ -1268,6 +1268,14 @@ class AIAgent:
         from agent.conversation_compression import replay_compression_warning
         replay_compression_warning(self)
 
+    def _uses_non_streaming_runtime(self) -> bool:
+        """Return whether the active provider requires one-shot ACP semantics."""
+        from agent.copilot_acp_client import is_external_acp_runtime
+
+        return is_external_acp_runtime(
+            getattr(self, "provider", None), getattr(self, "base_url", None)
+        )
+
     def _is_direct_openai_url(self, base_url: str = None) -> bool:
         """Return True when a base URL targets OpenAI's native API."""
         if base_url is not None:
