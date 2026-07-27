@@ -29,6 +29,7 @@ def _prepare_kimi(monkeypatch, tmp_path) -> Path:
     home = tmp_path / "home"
     home.mkdir()
     binary = _install_fake_kimi(home)
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
     monkeypatch.setattr(Path, "home", lambda: home)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("KIMI_CODE_CLI_PATH", str(binary))

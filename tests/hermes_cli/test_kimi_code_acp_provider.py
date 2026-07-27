@@ -19,6 +19,7 @@ def _install_fake_kimi(home: Path) -> Path:
 
 def _clear_external_process_overrides(monkeypatch) -> None:
     for name in (
+        "HERMES_REAL_HOME",
         "KIMI_CODE_CLI_PATH",
         "HERMES_COPILOT_ACP_COMMAND",
         "COPILOT_CLI_PATH",
