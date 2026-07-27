@@ -20,6 +20,9 @@ export default defineConfig([
       globals: globals.browser,
     },
     rules: {
+      // ESLint 10 added this rule to its recommended preset. Keep the ESLint 9
+      // lint baseline until existing control-flow assignments are refactored.
+      'no-useless-assignment': 'off',
       // Context providers and hook files commonly export both a component
       // (the Provider) and a hook (useContext). Allow constant exports so
       // these don't need to be split into separate files.

@@ -15,7 +15,6 @@ import js from '@eslint/js'
 import typescriptEslint from '@typescript-eslint/eslint-plugin'
 import typescriptParser from '@typescript-eslint/parser'
 import perfectionist from 'eslint-plugin-perfectionist'
-import reactPlugin from 'eslint-plugin-react'
 import hooksPlugin from 'eslint-plugin-react-hooks'
 import unusedImports from 'eslint-plugin-unused-imports'
 import globals from 'globals'
@@ -41,7 +40,6 @@ export default [
     plugins: {
       '@typescript-eslint': typescriptEslint,
       perfectionist,
-      react: reactPlugin,
       'react-hooks': hooksPlugin,
       'unused-imports': unusedImports
     },
@@ -51,6 +49,9 @@ export default [
       curly: ['error', 'all'],
       'no-fallthrough': ['error', { allowEmptyCase: true }],
       'no-undef': 'off',
+      // ESLint 10 added these rules to its recommended preset. Keep the ESLint
+      // 9 lint baseline until the existing code paths are refactored separately.
+      'no-useless-assignment': 'off',
       'no-unused-vars': 'off',
       'padding-line-between-statements': [
         1,
@@ -92,12 +93,10 @@ export default [
       'perfectionist/sort-jsx-props': ['error', { order: 'asc', type: 'natural' }],
       'perfectionist/sort-named-exports': ['error', { order: 'asc', type: 'natural' }],
       'perfectionist/sort-named-imports': ['error', { order: 'asc', type: 'natural' }],
+      'preserve-caught-error': 'off',
       'react-hooks/exhaustive-deps': 'warn',
       'react-hooks/rules-of-hooks': 'error',
       'unused-imports/no-unused-imports': 'error'
-    },
-    settings: {
-      react: { version: 'detect' }
     }
   },
   {
