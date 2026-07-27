@@ -73,6 +73,18 @@ def test_doctor_reports_external_process_provider_ready(tmp_path, monkeypatch, c
     monkeypatch.setattr(Path, "home", lambda: home)
     _clear_external_process_overrides(monkeypatch)
     monkeypatch.setenv("PATH", os.defpath)
+    monkeypatch.setattr(
+        "agent.copilot_acp_client.probe_external_acp_initialize",
+        lambda _provider: {
+            "protocolVersion": 1,
+            "agentInfo": {"name": "Kimi Code CLI", "version": "test"},
+            "authMethods": [{"id": "login"}],
+            "agentCapabilities": {
+                "promptCapabilities": {"image": True, "embeddedContext": True},
+                "sessionCapabilities": {"resume": {}},
+            },
+        },
+    )
 
     from hermes_cli.doctor import external_process_provider_checks
 
@@ -84,6 +96,47 @@ def test_doctor_reports_external_process_provider_ready(tmp_path, monkeypatch, c
     # Structural check only — no HTTP probing, no marker contents.
     assert "http" not in out.lower()
     assert "MARKER-CONTENT-MUST-NOT-APPEAR" not in out
+    assert "read-only protocol and capabilities verified" in out
+
+
+def test_doctor_reports_each_missing_kimi_acp_contract_without_starting_session(
+    tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    _install_fake_kimi(home)
+    marker = home / ".kimi-code" / "credentials" / "kimi-code.json"
+    marker.parent.mkdir(parents=True)
+    marker.touch()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    _clear_external_process_overrides(monkeypatch)
+    monkeypatch.setenv("PATH", os.defpath)
+    calls = []
+    monkeypatch.setattr(
+        "agent.copilot_acp_client.probe_external_acp_initialize",
+        lambda provider: calls.append(provider)
+        or {
+            "protocolVersion": 99,
+            "agentInfo": {"name": "wrong"},
+            "authMethods": [],
+            "agentCapabilities": {
+                "promptCapabilities": {},
+                "sessionCapabilities": {},
+            },
+        },
+    )
+
+    from hermes_cli.doctor import external_process_provider_checks
+
+    external_process_provider_checks()
+
+    out = capsys.readouterr().out
+    assert calls == ["kimi-code"]
+    assert "incompatible protocolVersion" in out
+    assert "unexpected agent identity" in out
+    assert "missing auth method: login" in out
+    assert "missing prompt capability: image" in out
+    assert "missing session capability: resume" in out
 
 
 def test_doctor_reports_missing_cli_with_override_hint_and_no_secrets(

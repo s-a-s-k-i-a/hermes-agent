@@ -276,6 +276,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     "kimi-code": [
         "k3",
+        "k3-256k",
     ],
     "copilot": [
         "gpt-5.4",
@@ -1095,7 +1096,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("nvidia",         "NVIDIA NIM",               "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ProviderEntry("copilot",        "GitHub Copilot",           "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
-    ProviderEntry("kimi-code",      "Kimi Code (OAuth / subscription)", "Kimi Code CLI (Uses its existing OAuth subscription via ACP)"),
+    ProviderEntry("kimi-code",      "Kimi Code ACP account (OAuth / subscription)", "Kimi Code CLI account integration (model route unavailable until ACP preserves privileged instructions)"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
     ProviderEntry("vertex",         "Google Vertex AI",         "Google Vertex AI (Gemini via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),

@@ -2263,6 +2263,20 @@ def get_model_context_length(
     # local servers actually know about.  Ollama "model:tag" colons are preserved.
     model = _strip_provider_prefix(model)
 
+    # Exact provider-profile metadata.  This is authoritative for transports
+    # such as ACP that have no HTTP model endpoint and prevents a cached value
+    # learned on another route from leaking into this provider.
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile((provider or "").strip().lower())
+        profile_contexts = getattr(profile, "model_context_lengths", {}) or {}
+        profile_context = profile_contexts.get(model.strip().lower())
+        if isinstance(profile_context, int) and profile_context > 0:
+            return profile_context
+    except Exception:
+        pass
+
     # Endpoint-scoped provider metadata. Keep this ahead of the persistent
     # cache so a value learned for a multiplexed provider's other endpoint
     # cannot override the endpoint where the model was actually validated.

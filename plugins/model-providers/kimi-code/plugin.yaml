@@ -1,5 +1,5 @@
 name: kimi-code-provider
 kind: model-provider
 version: 1.0.0
-description: Kimi Code OAuth/subscription via its local ACP subprocess
+description: Kimi Code ACP account integration; model route capability-gated
 author: Nous Research

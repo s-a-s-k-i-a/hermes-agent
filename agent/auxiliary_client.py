@@ -5561,6 +5561,20 @@ def resolve_provider_client(
                 else (client, final_model))
 
     if pconfig.auth_type == "external_process":
+        try:
+            from providers import get_provider_profile
+
+            _scope_profile = get_provider_profile(provider)
+        except Exception:
+            _scope_profile = None
+        if (
+            _scope_profile is not None
+            and not _scope_profile.external_preserves_system_instructions
+        ):
+            raise ValueError(
+                f"provider {provider!r} cannot be used as a Hermes model: "
+                "ACP does not preserve privileged system instructions"
+            )
         creds = resolve_external_process_provider_credentials(provider)
         try:
             from providers import get_provider_profile

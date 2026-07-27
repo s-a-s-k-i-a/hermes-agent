@@ -1951,7 +1951,6 @@ def _model_flow_kimi_code(config, current_model=""):
     from hermes_cli.auth import (
         PROVIDER_REGISTRY,
         _prompt_model_selection,
-        _save_model_choice,
         deactivate_provider,
         get_external_process_provider_status,
         resolve_external_process_provider_credentials,
@@ -1965,6 +1964,14 @@ def _model_flow_kimi_code(config, current_model=""):
     provider_id = "kimi-code"
     pconfig = PROVIDER_REGISTRY[provider_id]
     profile = get_provider_profile(provider_id)
+    if profile is not None and not profile.external_preserves_system_instructions:
+        print("  Kimi Code ACP is an agent backend, not a Hermes model route.")
+        print(
+            "  The current ACP protocol accepts user prompt blocks but no privileged "
+            "Hermes system-instruction channel."
+        )
+        print("  No model configuration was changed.")
+        return
     status = get_external_process_provider_status(provider_id)
     command = status.get("resolved_command") or status.get("command") or "kimi"
     effective_base = status.get("base_url") or pconfig.inference_base_url
@@ -2016,17 +2023,22 @@ def _model_flow_kimi_code(config, current_model=""):
         print("No change.")
         return
 
-    _save_model_choice(selected)
     cfg = load_config()
     model = cfg.get("model")
     if not isinstance(model, dict):
         model = {"default": model} if model else {}
         cfg["model"] = model
+    model["default"] = selected
     model["provider"] = provider_id
     model["base_url"] = effective_base
     model["api_mode"] = "chat_completions"
     clear_model_endpoint_credentials(model, clear_api_mode=False)
-    save_config(cfg)
+    try:
+        save_config(cfg)
+    except Exception as exc:
+        print(f"  ⚠ Could not save Kimi model configuration atomically: {exc}")
+        print("  No model configuration was changed.")
+        return
     deactivate_provider()
 
     print(f"Default model set to: {selected} (via {pconfig.name})")

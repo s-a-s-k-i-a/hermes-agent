@@ -370,6 +370,71 @@ def external_process_provider_checks() -> None:
                     f"(status check failed: {_redacted_error_text(status['error'])})",
                 )
                 continue
+            profile = None
+            try:
+                from providers import get_provider_profile
+
+                profile = get_provider_profile(provider_id)
+            except Exception:
+                profile = None
+
+            if (
+                status.get("installed")
+                and profile is not None
+                and getattr(profile, "external_doctor_probe_initialize", False)
+            ):
+                try:
+                    from agent.copilot_acp_client import probe_external_acp_initialize
+
+                    initialized = probe_external_acp_initialize(provider_id)
+                    problems: list[str] = []
+                    if initialized.get("protocolVersion") != 1:
+                        problems.append("incompatible protocolVersion")
+                    expected_name = str(
+                        getattr(profile, "external_expected_agent_name", "") or ""
+                    )
+                    actual_name = str(
+                        (initialized.get("agentInfo") or {}).get("name") or ""
+                    )
+                    if expected_name and actual_name != expected_name:
+                        problems.append("unexpected agent identity")
+                    auth_ids = {
+                        str(item.get("id") or "")
+                        for item in initialized.get("authMethods") or []
+                        if isinstance(item, dict)
+                    }
+                    for required in profile.external_required_auth_methods:
+                        if required not in auth_ids:
+                            problems.append(f"missing auth method: {required}")
+                    agent_caps = initialized.get("agentCapabilities") or {}
+                    prompt_caps = agent_caps.get("promptCapabilities") or {}
+                    for required in profile.external_required_prompt_capabilities:
+                        if prompt_caps.get(required) is not True:
+                            problems.append(f"missing prompt capability: {required}")
+                    session_caps = agent_caps.get("sessionCapabilities") or {}
+                    for required in profile.external_required_session_capabilities:
+                        if required not in session_caps:
+                            problems.append(f"missing session capability: {required}")
+                    if problems:
+                        check_warn(
+                            f"{pconfig.name} ACP initialize",
+                            f"({'; '.join(problems)})",
+                        )
+                        check_info("Run 'kimi upgrade' and retry 'hermes doctor'")
+                    else:
+                        check_ok(
+                            f"{pconfig.name} ACP initialize",
+                            "(read-only protocol and capabilities verified)",
+                        )
+                except TimeoutError:
+                    check_warn(
+                        f"{pconfig.name} ACP initialize", "(timed out)"
+                    )
+                except Exception as exc:
+                    check_warn(
+                        f"{pconfig.name} ACP initialize",
+                        f"(handshake failed: {_redacted_error_text(exc)})",
+                    )
             # Command values (resolved paths) never appear in doctor output:
             # the central redactor intentionally skips token-shaped path
             # segments, so the only safe treatment is omission.

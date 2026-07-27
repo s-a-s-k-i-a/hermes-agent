@@ -79,6 +79,15 @@ class ProviderProfile:
     external_login_markers: tuple = ()
     external_logout_args: tuple = ()
     external_logout_removes_login_markers: bool = False
+    external_doctor_probe_initialize: bool = False
+    external_expected_agent_name: str = ""
+    external_required_auth_methods: tuple = ()
+    external_required_prompt_capabilities: tuple = ()
+    external_required_session_capabilities: tuple = ()
+    # True only when the external protocol can preserve Hermes' privileged
+    # system-message role.  Agent protocols that accept only user prompt
+    # blocks must not be exposed as equivalent primary/fallback LLM routes.
+    external_preserves_system_instructions: bool = True
 
     # ── Vision support ────────────────────────────────────────
     # True when the provider's API accepts image content inside
@@ -100,6 +109,10 @@ class ProviderProfile:
     # fallback_models: curated list shown in /model picker when live fetch fails.
     # Only agentic models that support tool calling should appear here.
     fallback_models: tuple = ()
+    # Exact provider-owned context windows keyed by the model ids exposed by
+    # this profile.  External transports cannot be probed over HTTP, so this
+    # is their authoritative, declarative metadata source.
+    model_context_lengths: dict[str, int] = field(default_factory=dict)
 
     # hostname: base hostname for URL→provider reverse-mapping in model_metadata.py
     # e.g. "api.gmi-serving.com". Derived from base_url when empty.

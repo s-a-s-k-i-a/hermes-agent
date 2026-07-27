@@ -7,6 +7,9 @@ import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
 
 
 def _install_fake_kimi(home: Path) -> Path:
@@ -40,13 +43,18 @@ def test_kimi_code_profile_and_provider_catalog_metadata():
     assert profile.auth_type == "external_process"
     assert profile.base_url == "acp://kimi"
     assert profile.default_aux_model == "k3"
-    assert profile.fallback_models == ("k3",)
+    assert profile.fallback_models == ("k3", "k3-256k")
+    assert profile.model_context_lengths == {"k3": 1_048_576, "k3-256k": 262_144}
     assert "OAuth" in profile.display_name
     assert profile.external_command_env_vars == ("KIMI_CODE_CLI_PATH",)
     assert profile.external_preferred_commands == ("~/.kimi-code/bin/kimi",)
     assert profile.external_default_command == "kimi"
     assert profile.external_default_args == ("acp",)
-    assert profile.external_process_env_vars == ("KIMI_CODE_HOME",)
+    assert "KIMI_CODE_HOME" in profile.external_process_env_vars
+    assert "KIMI_DISABLE_TELEMETRY" in profile.external_process_env_vars
+    assert "KIMI_CODE_NO_AUTO_UPDATE" in profile.external_process_env_vars
+    assert "HTTPS_PROXY" in profile.external_process_env_vars
+    assert "NODE_EXTRA_CA_CERTS" in profile.external_process_env_vars
     assert profile.external_data_root_env_var == "KIMI_CODE_HOME"
     assert profile.external_default_data_root == "~/.kimi-code"
     assert profile.external_login_args == ("login",)
@@ -61,6 +69,22 @@ def test_kimi_code_profile_and_provider_catalog_metadata():
     assert descriptor.auth_type == "external_process"
     assert descriptor.tab == "accounts"
     assert "OAuth" in descriptor.label
+
+
+def test_kimi_profile_forwards_private_hermes_session_binding():
+    from providers import get_provider_profile
+
+    profile = get_provider_profile("kimi-code")
+    extra_body, top_level = profile.build_api_kwargs_extras(
+        reasoning_config={"enabled": True, "effort": "high"},
+        session_id="hermes-session-123",
+    )
+
+    assert extra_body == {}
+    assert top_level == {
+        "reasoning_config": {"enabled": True, "effort": "high"},
+        "_hermes_session_id": "hermes-session-123",
+    }
 
 
 def test_kimi_code_status_distinguishes_installed_cli_from_logged_in_marker(
@@ -234,6 +258,9 @@ def test_auth_add_kimi_code_runs_visible_cli_login_without_prompting_or_pool_sto
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
+        marker = provider_home / "credentials" / "kimi-code.json"
+        marker.parent.mkdir(parents=True)
+        marker.touch()
         return run
 
     monkeypatch.setattr("hermes_cli.auth.subprocess.run", fake_run)
@@ -283,6 +310,65 @@ def test_auth_add_kimi_code_runs_visible_cli_login_without_prompting_or_pool_sto
     assert auth_path.read_text(encoding="utf-8") == original_auth
 
 
+def test_kimi_code_login_exit_zero_without_marker_fails_verification(
+    tmp_path, monkeypatch, capsys
+):
+    from hermes_cli.auth import AuthError, run_external_process_provider_login
+
+    home = tmp_path / "home"
+    home.mkdir()
+    binary = _install_fake_kimi(home)
+    provider_home = tmp_path / "kimi-home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("KIMI_CODE_HOME", str(provider_home))
+    monkeypatch.setenv("KIMI_CODE_CLI_PATH", str(binary))
+    monkeypatch.setattr(
+        "hermes_cli.auth.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([str(binary), "login"], 0),
+    )
+
+    with pytest.raises(AuthError, match="no safe, readable login marker"):
+        run_external_process_provider_login("kimi-code")
+
+    assert "login completed" not in capsys.readouterr().out.lower()
+
+
+@pytest.mark.parametrize("symlink_kind", ["parent", "marker"])
+def test_kimi_code_status_and_logout_reject_symlinked_login_marker(
+    tmp_path, monkeypatch, symlink_kind
+):
+    from hermes_cli.auth import (
+        get_external_process_provider_status,
+        run_external_process_provider_logout,
+    )
+
+    home = tmp_path / "home"
+    home.mkdir()
+    binary = _install_fake_kimi(home)
+    provider_home = tmp_path / "kimi-home"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_marker = outside / "kimi-code.json"
+    outside_marker.write_text("outside-must-survive", encoding="utf-8")
+    provider_home.mkdir()
+    if symlink_kind == "parent":
+        (provider_home / "credentials").symlink_to(outside, target_is_directory=True)
+    else:
+        credentials = provider_home / "credentials"
+        credentials.mkdir()
+        (credentials / "kimi-code.json").symlink_to(outside_marker)
+
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("KIMI_CODE_HOME", str(provider_home))
+    monkeypatch.setenv("KIMI_CODE_CLI_PATH", str(binary))
+
+    assert get_external_process_provider_status("kimi-code")["logged_in"] is False
+    assert run_external_process_provider_logout("kimi-code") is False
+    assert outside_marker.read_text(encoding="utf-8") == "outside-must-survive"
+
+
 def test_console_auth_add_api_key_override_does_not_require_key_for_kimi():
     from hermes_cli.console_engine import _apply_confirmed_defaults
 
@@ -312,38 +398,33 @@ def test_kimi_code_cli_path_override_wins_over_default_location(tmp_path, monkey
     assert credentials["command"] == str(override)
 
 
-def test_runtime_provider_resolves_kimi_code_without_api_key(tmp_path, monkeypatch):
+def test_runtime_provider_rejects_kimi_code_as_model_route(tmp_path, monkeypatch):
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     home = tmp_path / "home"
     home.mkdir()
-    binary = _install_fake_kimi(home)
+    _install_fake_kimi(home)
     monkeypatch.setattr(Path, "home", lambda: home)
     _clear_external_process_overrides(monkeypatch)
     monkeypatch.setenv("PATH", os.defpath)
 
-    runtime = resolve_runtime_provider(requested="kimi-code", target_model="k3")
-
-    assert runtime == {
-        "provider": "kimi-code",
-        "api_mode": "chat_completions",
-        "base_url": "acp://kimi",
-        "api_key": "external-process",
-        "command": str(binary),
-        "args": ["acp"],
-        "source": "process",
-        "requested_provider": "kimi-code",
-    }
+    with pytest.raises(ValueError, match="not a Hermes model route"):
+        resolve_runtime_provider(requested="kimi-code", target_model="k3")
 
 
-def test_interactive_kimi_model_flow_runs_cli_owned_login_before_persisting(
+def test_interactive_kimi_model_flow_fails_closed_without_auth_or_config_change(
     tmp_path, monkeypatch
 ):
-    from hermes_cli.config import load_config
+    from hermes_cli.config import load_config, save_config
     from hermes_cli.model_setup_flows import _model_flow_kimi_code
 
     hermes_home = tmp_path / "hermes"
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    cfg = load_config()
+    cfg["model"] = {"provider": "anthropic", "default": "prior-model"}
+    save_config(cfg)
+    config_path = hermes_home / "config.yaml"
+    before = config_path.read_bytes()
     statuses = iter(
         [
             {
@@ -382,11 +463,12 @@ def test_interactive_kimi_model_flow_runs_cli_owned_login_before_persisting(
 
     _model_flow_kimi_code({}, current_model="")
 
-    assert login_calls == ["kimi-code"]
-    model = load_config()["model"]
-    assert model["provider"] == "kimi-code"
-    assert model["default"] == "k3"
-    assert model["base_url"] == "acp://kimi"
+    assert login_calls == []
+    assert config_path.read_bytes() == before
+    assert load_config()["model"] == {
+        "provider": "anthropic",
+        "default": "prior-model",
+    }
 
 
 def test_interactive_kimi_login_failure_leaves_config_byte_identical(
@@ -437,3 +519,89 @@ def test_interactive_kimi_login_failure_leaves_config_byte_identical(
         "provider": "anthropic",
         "default": "prior-model",
     }
+
+
+def test_kimi_model_flow_uses_one_atomic_write_when_role_capability_exists(
+    tmp_path, monkeypatch
+):
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.model_setup_flows import _model_flow_kimi_code
+    from providers import get_provider_profile
+
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    cfg = load_config()
+    cfg["model"] = {"provider": "anthropic", "default": "prior-model"}
+    save_config(cfg)
+    profile = get_provider_profile("kimi-code")
+    monkeypatch.setattr(profile, "external_preserves_system_instructions", True)
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_external_process_provider_status",
+        lambda _provider: {
+            "installed": True,
+            "logged_in": True,
+            "resolved_command": "/tmp/kimi",
+            "base_url": "acp://kimi",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_external_process_provider_credentials",
+        lambda _provider: {"base_url": "acp://kimi", "command": "/tmp/kimi"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth._prompt_model_selection", lambda *_args, **_kwargs: "k3-256k"
+    )
+
+    with patch("hermes_cli.config.save_config", wraps=save_config) as save:
+        _model_flow_kimi_code({}, current_model="prior-model")
+
+    assert save.call_count == 1
+    assert load_config()["model"] == {
+        "provider": "kimi-code",
+        "default": "k3-256k",
+        "base_url": "acp://kimi",
+        "api_mode": "chat_completions",
+    }
+
+
+def test_kimi_model_flow_atomic_write_failure_keeps_original_bytes(
+    tmp_path, monkeypatch, capsys
+):
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.model_setup_flows import _model_flow_kimi_code
+    from providers import get_provider_profile
+
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    cfg = load_config()
+    cfg["model"] = {"provider": "anthropic", "default": "prior-model"}
+    save_config(cfg)
+    path = hermes_home / "config.yaml"
+    before = path.read_bytes()
+    profile = get_provider_profile("kimi-code")
+    monkeypatch.setattr(profile, "external_preserves_system_instructions", True)
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_external_process_provider_status",
+        lambda _provider: {
+            "installed": True,
+            "logged_in": True,
+            "resolved_command": "/tmp/kimi",
+            "base_url": "acp://kimi",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_external_process_provider_credentials",
+        lambda _provider: {"base_url": "acp://kimi", "command": "/tmp/kimi"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth._prompt_model_selection", lambda *_args, **_kwargs: "k3"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.save_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk sentinel")),
+    )
+
+    _model_flow_kimi_code({}, current_model="prior-model")
+
+    assert path.read_bytes() == before
+    assert "Could not save Kimi model configuration atomically" in capsys.readouterr().out

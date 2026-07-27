@@ -66,7 +66,49 @@ def _install_fake_kimi_home(tmp_path, monkeypatch, *, logged_in=True):
     for name in ("KIMI_CODE_CLI_PATH", "COPILOT_CLI_PATH"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PATH", os.defpath)
+    from providers import get_provider_profile
+
+    # Most tests below exercise the generic external-process selection and
+    # atomic-write contracts as if ACP had a privileged instruction channel.
+    # The dedicated fail-closed test covers Kimi's current real capability.
+    monkeypatch.setattr(
+        get_provider_profile("kimi-code"),
+        "external_preserves_system_instructions",
+        True,
+    )
     return home
+
+
+def test_apply_noninteractive_kimi_fails_closed_without_config_mutation(
+    tmp_path, monkeypatch
+):
+    import os
+    from pathlib import Path
+
+    import pytest
+
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.model_noninteractive import (
+        NonInteractiveSelectionError,
+        apply_noninteractive_model_selection,
+        resolve_noninteractive_selection,
+    )
+
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    cfg = load_config()
+    cfg["model"] = {"provider": "anthropic", "default": "prior-model"}
+    save_config(cfg)
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    before = config_path.read_bytes()
+
+    selection = resolve_noninteractive_selection("kimi-code", "k3")
+    with pytest.raises(NonInteractiveSelectionError) as excinfo:
+        apply_noninteractive_model_selection(selection)
+
+    assert excinfo.value.exit_code == 2
+    assert "cannot preserve privileged system instructions" in str(excinfo.value)
+    assert config_path.read_bytes() == before
 
 
 def test_apply_noninteractive_model_selection_writes_config_without_credentials(

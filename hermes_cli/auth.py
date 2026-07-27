@@ -6771,6 +6771,73 @@ def _resolve_external_process_launch(provider_id: str) -> tuple[str, list[str]]:
     return command, args
 
 
+def _external_process_login_marker_state(
+    provider_id: str,
+) -> tuple[list[str], list[Path]]:
+    """Return display paths and symlink-safe, readable login markers.
+
+    The provider data root itself may be a deliberate symlink, so it is
+    resolved first.  Marker parents and marker files are then required to be
+    real filesystem objects below that physical root.  This makes status and
+    logout share exactly one fail-closed path contract.
+    """
+    from providers import get_provider_profile
+
+    profile = get_provider_profile(provider_id)
+    if profile is None or profile.auth_type != "external_process":
+        return [], []
+
+    raw_root = ""
+    if profile.external_data_root_env_var:
+        raw_root = os.getenv(profile.external_data_root_env_var, "").strip()
+    if not raw_root:
+        raw_root = str(profile.external_default_data_root or "").strip()
+
+    data_root: Optional[Path] = None
+    physical_root: Optional[Path] = None
+    if raw_root:
+        data_root = (
+            Path.home() / raw_root[2:]
+            if raw_root.startswith("~/")
+            else Path(raw_root).expanduser()
+        )
+        try:
+            physical_root = data_root.resolve(strict=False)
+        except (OSError, RuntimeError):
+            physical_root = None
+
+    display_paths: list[str] = []
+    safe_markers: list[Path] = []
+    for raw_marker in tuple(profile.external_login_markers or ()):
+        marker_text = str(raw_marker or "").strip()
+        if not marker_text:
+            continue
+        if data_root is not None and not Path(marker_text).is_absolute():
+            marker = data_root / marker_text
+        elif marker_text.startswith("~/"):
+            marker = Path.home() / marker_text[2:]
+        else:
+            marker = Path(marker_text).expanduser()
+        display_paths.append(str(marker))
+
+        if physical_root is None:
+            continue
+        try:
+            # A symlink at either boundary can redirect status or deletion to
+            # an attacker-controlled target outside the provider data root.
+            if marker.is_symlink() or marker.parent.is_symlink():
+                continue
+            resolved_marker = marker.resolve(strict=True)
+            resolved_marker.relative_to(physical_root)
+            if not resolved_marker.is_file() or not os.access(resolved_marker, os.R_OK):
+                continue
+        except (FileNotFoundError, OSError, RuntimeError, ValueError):
+            continue
+        safe_markers.append(resolved_marker)
+
+    return display_paths, safe_markers
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
@@ -6783,38 +6850,12 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
         base_url = pconfig.inference_base_url
 
     resolved_command = shutil.which(command) if command else None
-    from providers import get_provider_profile
-
-    profile = get_provider_profile(provider_id)
-    marker_paths: list[str] = []
-    data_root: Optional[Path] = None
-    if profile and profile.external_data_root_env_var:
-        raw_root = os.getenv(profile.external_data_root_env_var, "").strip()
-        if not raw_root:
-            raw_root = str(profile.external_default_data_root or "").strip()
-        if raw_root:
-            if raw_root.startswith("~/"):
-                data_root = Path.home() / raw_root[2:]
-            else:
-                data_root = Path(raw_root).expanduser()
-    for raw_marker in tuple(
-        getattr(profile, "external_login_markers", ()) if profile else ()
-    ):
-        marker = str(raw_marker or "").strip()
-        if not marker:
-            continue
-        if data_root is not None and not Path(marker).is_absolute():
-            marker_path = data_root / marker
-        elif marker.startswith("~/"):
-            marker_path = Path.home() / marker[2:]
-        else:
-            marker_path = Path(marker).expanduser()
-        marker_paths.append(str(marker_path))
+    marker_paths, safe_markers = _external_process_login_marker_state(provider_id)
 
     installed = bool(resolved_command or base_url.startswith("acp+tcp://"))
     logged_in = installed
     if marker_paths:
-        logged_in = installed and any(Path(path).is_file() for path in marker_paths)
+        logged_in = installed and bool(safe_markers)
     return {
         "configured": logged_in,
         "installed": installed,
@@ -6897,8 +6938,10 @@ def run_external_process_provider_login(provider_id: str) -> subprocess.Complete
     resolved_command = shutil.which(command) if command else None
     login_args = [str(arg) for arg in profile.external_login_args]
     if not resolved_command:
+        command_label = Path(command).name if command else provider_id
         raise AuthError(
-            f"Could not find the external CLI command '{command}' for provider '{provider_id}'.",
+            f"Could not start the {provider_id} CLI executable "
+            f"'{command_label}'. Check its installation or configured path.",
             provider=provider_id,
             code="missing_external_process_cli",
         )
@@ -6920,6 +6963,14 @@ def run_external_process_provider_login(provider_id: str) -> subprocess.Complete
             f"{provider_id} CLI login exited with status {result.returncode}.",
             provider=provider_id,
             code="external_process_login_failed",
+        )
+    post_status = get_external_process_provider_status(provider_id)
+    if profile.external_login_markers and not post_status.get("logged_in"):
+        raise AuthError(
+            f"{provider_id} CLI login exited successfully, but no safe, readable "
+            "login marker was created. Run the CLI login directly for diagnostics.",
+            provider=provider_id,
+            code="external_process_login_unverified",
         )
     return result
 
@@ -6953,8 +7004,8 @@ def run_external_process_provider_logout(provider_id: str) -> bool:
             )
     elif profile.external_logout_removes_login_markers:
         removed = False
-        for marker_text in status.get("login_markers") or []:
-            marker = Path(str(marker_text))
+        _marker_paths, safe_markers = _external_process_login_marker_state(provider_id)
+        for marker in safe_markers:
             try:
                 marker.unlink()
                 removed = True

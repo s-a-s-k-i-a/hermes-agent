@@ -1667,6 +1667,20 @@ def resolve_runtime_provider(
     external_config = PROVIDER_REGISTRY.get(requested_provider)
     if external_config and external_config.auth_type == "external_process":
         provider = external_config.id
+        try:
+            from providers import get_provider_profile
+
+            external_profile = get_provider_profile(provider)
+        except Exception:
+            external_profile = None
+        if (
+            external_profile is not None
+            and not external_profile.external_preserves_system_instructions
+        ):
+            raise ValueError(
+                f"provider {provider!r} is an ACP agent backend, not a Hermes model "
+                "route: its protocol cannot preserve privileged system instructions"
+            )
         creds = resolve_external_process_provider_credentials(provider)
         return {
             "provider": provider,

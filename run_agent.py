@@ -4643,6 +4643,13 @@ class AIAgent:
         primary_client = self._ensure_primary_openai_client(reason=reason)
         if self.provider == "moa":
             return primary_client
+        from agent.copilot_acp_client import ExternalACPClient
+
+        # ACP is a stateful session protocol.  Its shared client owns the
+        # long-lived child process and ACP session; manufacturing and closing a
+        # request-local facade would silently reset that state every turn.
+        if isinstance(primary_client, ExternalACPClient):
+            return primary_client
         if isinstance(primary_client, Mock):
             return primary_client
         with self._openai_client_lock():
@@ -4666,6 +4673,10 @@ class AIAgent:
         return self._create_openai_client(request_kwargs, reason=reason, shared=False)
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
+        from agent.copilot_acp_client import ExternalACPClient
+
+        if isinstance(client, ExternalACPClient) and client is getattr(self, "client", None):
+            return
         self._close_openai_client(client, reason=reason, shared=False)
 
     def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:

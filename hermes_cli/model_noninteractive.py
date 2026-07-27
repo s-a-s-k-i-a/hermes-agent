@@ -296,6 +296,22 @@ def validate_noninteractive_prerequisites(selection: Dict[str, Any]) -> None:
     provider_id = selection["provider"]
     auth_type = selection.get("auth_type") or "api_key"
     if auth_type == "external_process":
+        try:
+            from providers import get_provider_profile
+
+            profile = get_provider_profile(provider_id)
+        except Exception:
+            profile = None
+        if (
+            profile is not None
+            and not profile.external_preserves_system_instructions
+        ):
+            raise NonInteractiveSelectionError(
+                f"Provider '{provider_id}' is an ACP agent backend, not a "
+                "Hermes model route: its protocol cannot preserve privileged "
+                "system instructions. No model configuration was changed.",
+                exit_code=2,
+            )
         _check_external_process_prerequisites(provider_id)
     elif auth_type == "api_key":
         if provider_id == "openrouter":
