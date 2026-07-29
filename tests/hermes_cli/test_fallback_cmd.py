@@ -192,6 +192,45 @@ class TestListCommand:
 # ---------------------------------------------------------------------------
 
 class TestAddCommand:
+    def test_add_anthropic_opus_5_preserves_openai_codex_primary(
+        self, isolated_home, capsys
+    ):
+        _write_config(isolated_home, {
+            "model": {
+                "provider": "openai-codex",
+                "default": "gpt-5.6-sol",
+            },
+        })
+
+        def fake_picker(args=None):
+            from hermes_cli.config import load_config, save_config
+
+            cfg = load_config()
+            cfg["model"] = {
+                "provider": "anthropic",
+                "default": "claude-opus-5",
+            }
+            save_config(cfg)
+
+        with patch("hermes_cli.main.select_provider_and_model", side_effect=fake_picker), \
+                patch("hermes_cli.main._require_tty"):
+            from hermes_cli.fallback_cmd import cmd_fallback_add
+
+            cmd_fallback_add(types.SimpleNamespace())
+
+        cfg = _read_config(isolated_home)
+        assert cfg["model"] == {
+            "provider": "openai-codex",
+            "default": "gpt-5.6-sol",
+        }
+        assert cfg["fallback_providers"] == [
+            {"provider": "anthropic", "model": "claude-opus-5"}
+        ]
+        out = capsys.readouterr().out
+        assert "Added fallback" in out
+        assert "claude-opus-5" in out
+        assert "anthropic" in out
+
     def test_add_appends_new_entry(self, isolated_home, capsys):
         _write_config(isolated_home, {
             "model": {"provider": "anthropic", "default": "claude-sonnet-4-6"},
