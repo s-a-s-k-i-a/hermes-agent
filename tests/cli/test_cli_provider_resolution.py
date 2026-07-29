@@ -515,9 +515,9 @@ def test_model_flow_anthropic_clears_stale_custom_key_and_mode(tmp_path, monkeyp
 
 def test_model_flow_anthropic_passes_live_discovery_list_to_picker(tmp_path, monkeypatch):
     """Regression for PR #62986 review: _model_flow_anthropic() must forward
-    provider_model_ids("anthropic")'s result to _prompt_model_selection() rather
+    cached_provider_model_ids("anthropic")'s result to _prompt_model_selection() rather
     than reading the static _PROVIDER_MODELS list directly. Patches
-    provider_model_ids() with a live-only sentinel absent from the static
+    cached_provider_model_ids() with a live-only sentinel absent from the static
     catalog and asserts the picker receives exactly that list.
     """
     config_path = _seed_stale_custom_model(tmp_path, monkeypatch)
@@ -539,7 +539,7 @@ def test_model_flow_anthropic_passes_live_discovery_list_to_picker(tmp_path, mon
     live_only_sentinel = "claude-live-only-sentinel-9999"
     assert live_only_sentinel not in M._PROVIDER_MODELS["anthropic"]
     monkeypatch.setattr(
-        "hermes_cli.models.provider_model_ids",
+        "hermes_cli.models.cached_provider_model_ids",
         lambda provider, **kwargs: [live_only_sentinel],
     )
 

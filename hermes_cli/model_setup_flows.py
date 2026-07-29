@@ -3030,7 +3030,7 @@ def _model_flow_anthropic(config, current_model=""):
         save_config,
         save_anthropic_api_key,
     )
-    from hermes_cli.models import provider_model_ids
+    from hermes_cli.models import cached_provider_model_ids
 
     # Check ALL credential sources
     from hermes_cli.auth import get_anthropic_key
@@ -3132,7 +3132,7 @@ def _model_flow_anthropic(config, current_model=""):
     print()
 
     # Model selection
-    model_list = provider_model_ids("anthropic")
+    model_list = cached_provider_model_ids("anthropic")
     if model_list:
         selected = _prompt_model_selection(
             model_list,
